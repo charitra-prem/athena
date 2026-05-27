@@ -1,0 +1,21 @@
+{
+  "name": "athena-webhook",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "presync": "cp ../agent.ts ./agent.ts",
+    "sync": "echo synced",
+    "predeploy": "npm run presync",
+    "deploy": "vercel deploy --prod --yes"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.6.0",
+    "@vercel/sandbox": "^1.10.2",
+    "ms": "^2.1.3"
+  },
+  "devDependencies": {
+    "@types/ms": "^2.1.0",
+    "@types/node": "^22.10.0",
+    "@vercel/node": "^5.8.5"
+  }
+}
