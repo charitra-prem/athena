@@ -1,4 +1,7 @@
 {
+  "rewrites": [
+    { "source": "/", "destination": "/api/sign-in" }
+  ],
   "functions": {
     "api/wake.ts": {
       "memory": 512,

@@ -1,16 +1,17 @@
-// Sign-in page. Renders Clerk's hosted sign-in widget (magic link / email /
-// social). After auth completes, client-side JS calls /api/link-slack with
-// the slack id from the URL; the backend verifies the Clerk session and
-// writes the user-link mapping. No copy-paste, no profile-metadata edits.
+// Sign-in page + post-OAuth landing.
+//
+// Two entry paths land here:
+//   1. /api/sign-in?slack=<team>:<user> — first visit (from the slash command)
+//   2. / (root, rewritten via vercel.json) — Clerk OAuth providers redirect
+//      back to the app's origin; they don't preserve our query, so we recover
+//      the slack id from sessionStorage stashed at step 1.
+//
+// In both cases the same page is rendered and the same script runs.
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default function handler(req: VercelRequest, res: VercelResponse) {
-  const slack = typeof req.query.slack === "string" ? req.query.slack : "";
-  // .trim() to drop any stray newline some env stores can append on paste.
+  const queryslack = typeof req.query.slack === "string" ? req.query.slack : "";
   const pk = (process.env.CLERK_PUBLISHABLE_KEY ?? "").trim();
-  if (!slack || !slack.includes(":")) {
-    return res.status(400).send("missing or malformed ?slack=<team>:<user>");
-  }
   if (!pk) return res.status(500).send("CLERK_PUBLISHABLE_KEY not set");
 
   // Derive Clerk frontend API host from publishable key (pk_(test|live)_<base64>$).
@@ -33,7 +34,7 @@ export default function handler(req: VercelRequest, res: VercelResponse) {
 </style>
 </head><body>
 <h1>Link Slack to Athena</h1>
-<p class="sub">Sign in below. Your Slack identity <code>${esc(slack)}</code> is linked automatically when auth completes.</p>
+<p class="sub" id="sub">Loading…</p>
 <div id="clerk-target"></div>
 <div id="status"></div>
 <script src="https://${frontendApi}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
@@ -41,43 +42,66 @@ export default function handler(req: VercelRequest, res: VercelResponse) {
         crossorigin="anonymous"
         async></script>
 <script>
-const SLACK = ${JSON.stringify(slack)};
+const QUERY_SLACK = ${JSON.stringify(queryslack)};
+const STORAGE_KEY = "athena_slack_link";
 const setStatus = (msg, cls) => {
   const el = document.getElementById("status");
   el.className = "status " + (cls || "");
   el.textContent = msg;
 };
-async function linkSlack() {
+const setSub = (msg) => { document.getElementById("sub").textContent = msg; };
+
+// Resolve the slack id: prefer URL ?slack=, fall back to sessionStorage stash.
+function resolveSlack() {
+  if (QUERY_SLACK && QUERY_SLACK.includes(":")) {
+    try { sessionStorage.setItem(STORAGE_KEY, QUERY_SLACK); } catch (_) {}
+    return QUERY_SLACK;
+  }
+  try { return sessionStorage.getItem(STORAGE_KEY) || ""; } catch (_) { return ""; }
+}
+
+async function linkSlack(slack) {
   setStatus("Linking your Slack identity…");
   const token = await window.Clerk.session.getToken();
   const r = await fetch("/api/link-slack", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
-    body: JSON.stringify({ slack: SLACK }),
+    body: JSON.stringify({ slack }),
   });
   if (r.ok) {
     document.getElementById("clerk-target").style.display = "none";
     setStatus("Linked. You can close this tab and return to Slack.", "ok");
+    try { sessionStorage.removeItem(STORAGE_KEY); } catch (_) {}
   } else {
     setStatus("Link failed: " + (await r.text()), "err");
   }
 }
+
 window.addEventListener("load", async () => {
+  const slack = resolveSlack();
+  if (!slack) {
+    setSub("Missing Slack identity.");
+    setStatus("Run /athena-login from Slack to get a sign-in link.", "err");
+    return;
+  }
+  setSub("Sign in below. Slack identity " + slack + " is linked automatically when auth completes.");
+
   const waitForClerk = () => new Promise((r) => {
     if (window.Clerk) return r();
     const i = setInterval(() => { if (window.Clerk) { clearInterval(i); r(); } }, 50);
   });
   await waitForClerk();
   await window.Clerk.load();
+
   if (window.Clerk.user) {
-    await linkSlack();
+    await linkSlack(slack);
     return;
   }
   window.Clerk.mountSignIn(document.getElementById("clerk-target"), {
-    forceRedirectUrl: window.location.href,
+    forceRedirectUrl: window.location.origin + "/",
   });
   window.Clerk.addListener(async ({ session }) => {
-    if (session) await linkSlack();
+    if (session) await linkSlack(slack);
   });
 });
 </script>
