@@ -10,6 +10,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import { spawnSandbox } from "../../lib/spawn.js";
+import { kv } from "../../lib/kv.js";
 
 function verifySlack(req: VercelRequest, rawBody: string): boolean {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
@@ -71,13 +72,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return;
       }
 
-      // ACK Slack immediately — fire-and-forget the spawn
-      res.status(200).json({ ok: true });
+      // Ignore message_changed / message_deleted / channel_join etc. — those
+      // arrive as ev.type "message" but with a subtype.
+      if (ev.type === "message" && ev.subtype) {
+        res.status(200).json({ skipped: `message subtype ${ev.subtype}` });
+        return;
+      }
 
       // Canonical thread id — survives across messages in the same Slack thread,
       // and is what KV / snapshots / Mastra Memory are keyed off.
       const threadRoot = ev.thread_ts ?? ev.ts;
       const threadId = `slack:${body.team_id}:${ev.channel}:${threadRoot}`;
+
+      // Follow-ups: a plain `message` event in a channel/group only triggers
+      // Athena if (a) it's a thread reply (thread_ts set) AND (b) Athena has
+      // state for that thread (i.e. we engaged in it before).
+      // DMs (message.im, where channel starts with "D") always pass through.
+      if (ev.type === "message") {
+        const isDm = (ev.channel ?? "").startsWith("D");
+        if (!isDm) {
+          if (!ev.thread_ts) {
+            res.status(200).json({ skipped: "channel top-level message" });
+            return;
+          }
+          // Cheap KV lookup — does Athena know this thread?
+          const state = await kv.get(`sandbox:${threadId}`).catch(() => null);
+          if (!state) {
+            res.status(200).json({ skipped: "thread not engaged" });
+            return;
+          }
+        }
+      }
+
+      // ACK Slack immediately — fire-and-forget the spawn
+      res.status(200).json({ ok: true });
 
       const envelope = {
         source: "slack-events",

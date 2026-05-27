@@ -1,17 +1,26 @@
 // Runs INSIDE the Vercel Sandbox, ONCE per event. Reads a normalized envelope
-// { source, type, data } from EVENT_PAYLOAD, acts, exits.
+// { source, type, threadId, data } from EVENT_PAYLOAD, acts, exits.
 //
-// Tools (priority order):
-//   reply   — post a reply in-thread. The 99% case.
-//   thread  — fetch recent messages in the current thread for context.
-//   shell   — escape hatch. Skills live in $SKILLS_DIR (slack, google, …).
+// Slack-events path: streams the agent's response live via Slack's
+// chat.startStream / chat.appendStream / chat.stopStream API. No reply tool
+// needed — the agent's text IS the stream.
+// Non-Slack sources: fall back to `chat.postMessage`-style "reply" tool.
+//
+// Tools (always available):
+//   reply  — post the full final message at once. Used for non-streaming sources.
+//   thread — fetch recent thread messages for context.
+//   shell  — escape hatch. Skills live in $SKILLS_DIR.
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
 import { UpstashStore, UpstashVector } from "@mastra/upstash";
-// Minimal AI-SDK-compatible embedder that hits OpenRouter's /embeddings
-// endpoint. Mastra's Memory.embedder only calls .doEmbed(), so this is all
-// that's required. No external package needed.
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
+import { z } from "zod";
+
+const exec = promisify(execCb);
+
+// ── OpenRouter embedder (AI-SDK-compatible) ──────────────────────────────
 const openrouterEmbedder = {
   specificationVersion: "v1" as const,
   provider: "openrouter",
@@ -25,10 +34,7 @@ const openrouterEmbedder = {
         Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "openai/text-embedding-3-small",
-        input: values,
-      }),
+      body: JSON.stringify({ model: "openai/text-embedding-3-small", input: values }),
     });
     const j = (await r.json()) as any;
     if (j.error) throw new Error(`openrouter embed: ${j.error.message ?? JSON.stringify(j.error)}`);
@@ -38,12 +44,8 @@ const openrouterEmbedder = {
     };
   },
 };
-import { exec as execCb } from "node:child_process";
-import { promisify } from "node:util";
-import { z } from "zod";
 
-const exec = promisify(execCb);
-
+// ── Envelope + slack helpers ─────────────────────────────────────────────
 type Envelope = {
   source: string;
   type: string;
@@ -53,6 +55,7 @@ type Envelope = {
     thread_id?: string | null;
     user?: string | null;
     text?: string | null;
+    team?: string | null;
     [k: string]: unknown;
   };
 };
@@ -77,22 +80,25 @@ async function slackApi(method: string, params: Record<string, any>, get = false
   return (await r.json()) as { ok: boolean; error?: string; [k: string]: any };
 }
 
+const isSlack = event.source.startsWith("slack-");
+
+// ── Tools ────────────────────────────────────────────────────────────────
 const reply = createTool({
   id: "reply",
   description:
-    "Post a reply in-thread to whoever triggered this event. Use this for normal responses.",
-  inputSchema: z.object({
-    text: z.string().describe("The reply text. Be concise."),
-  }),
+    "Post a full reply at once. ONLY used for non-Slack sources today — Slack " +
+    "events stream the response automatically; do not call this tool there.",
+  inputSchema: z.object({ text: z.string() }),
   execute: async (input: any) => {
     const text: string = input?.text ?? input?.context?.text ?? "";
-    if (event.source.startsWith("slack-")) {
+    if (isSlack) {
+      // Fallback: shouldn't be hit (we stream the response separately), but
+      // in case the agent calls it anyway, deliver as plain message.
       const j = await slackApi("chat.postMessage", {
         channel: event.data.channel,
         thread_ts: event.data.thread_id,
         text,
       });
-      console.log(`[reply] slack ok=${j.ok} ts=${j.ts ?? "-"} err=${j.error ?? "-"}`);
       return j.ok ? { ok: true, ts: j.ts } : { ok: false, error: j.error };
     }
     return { ok: false, error: `unsupported source: ${event.source}` };
@@ -101,14 +107,13 @@ const reply = createTool({
 
 const thread = createTool({
   id: "thread",
-  description:
-    "Fetch recent messages from the current thread for context. Returns up to `limit` messages.",
+  description: "Fetch recent messages from the current thread for context.",
   inputSchema: z.object({
     limit: z.number().int().min(1).max(50).optional().describe("Default 20."),
   }),
   execute: async (input: any) => {
     const limit: number = input?.limit ?? input?.context?.limit ?? 20;
-    if (event.source.startsWith("slack-")) {
+    if (isSlack) {
       const j = await slackApi(
         "conversations.replies",
         { channel: event.data.channel, ts: event.data.thread_id, limit: String(limit) },
@@ -120,7 +125,6 @@ const thread = createTool({
         user: m.user ?? m.bot_id ?? null,
         text: m.text,
       }));
-      console.log(`[thread] slack got ${messages.length} messages`);
       return { ok: true, messages };
     }
     return { ok: false, error: `unsupported source: ${event.source}` };
@@ -130,13 +134,10 @@ const thread = createTool({
 const shell = createTool({
   id: "shell",
   description:
-    "Run a shell command (bash -c). Use ONLY when reply/thread are insufficient — e.g., " +
-    "reacting with an emoji, fetching user info, posting to a different channel, attaching " +
-    "files, anything else. Skills live in $SKILLS_DIR (e.g. slack); read $SKILLS_DIR/<name>/SKILL.md " +
-    "for usage. Returns { stdout, stderr, exit }. 20s timeout.",
-  inputSchema: z.object({
-    cmd: z.string(),
-  }),
+    "Run a bash command. Use for anything not covered by streaming reply or thread — " +
+    "reactions, user lookups, cross-channel posts, file attachments. Skills live in " +
+    "$SKILLS_DIR (cat $SKILLS_DIR/<name>/SKILL.md). 20s timeout.",
+  inputSchema: z.object({ cmd: z.string() }),
   execute: async (input: any) => {
     const cmd: string = input?.cmd ?? input?.context?.cmd ?? "";
     console.log(`[shell] $ ${cmd}`);
@@ -158,32 +159,7 @@ const shell = createTool({
   },
 });
 
-const instructions = `You are Athena. You wake from one external event, act once, then exit.
-
-The event envelope is in your prompt: { source, type, data }.
-
-You have three tools:
-  • reply(text)     — post a reply in-thread to whoever triggered this event.
-  • thread(limit?)  — fetch recent messages in the current thread for context.
-  • shell(cmd)      — escape hatch for anything else (reactions, user lookups,
-                      cross-channel posts, file attachments, etc.). Skills are
-                      in $SKILLS_DIR; \`cat $SKILLS_DIR/<name>/SKILL.md\` tells
-                      you how to invoke each.
-
-Rules:
-  1. For typical mentions/DMs, call reply once and stop. Don't inspect skills
-     when a plain reply is enough — that's wasted turns.
-  2. Use thread first only if you need conversation context to answer well.
-  3. Use shell only when reply/thread cannot do the job.
-  4. After a successful reply, produce a one-line final message and stop.
-     Do not call more tools.
-  5. Never reply to your own messages (data.user, data.sender, data.bot_id).
-     The adapter already filters self-events but verify if in doubt.
-  6. Be concise.`;
-
-// Observational memory: lastMessages + semanticRecall + workingMemory,
-// keyed by event.threadId. Both inference and embeddings go through
-// OpenRouter (one provider, one key).
+// ── Memory ────────────────────────────────────────────────────────────────
 const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
   ? new Memory({
       storage: new UpstashStore({
@@ -205,20 +181,102 @@ const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
     })
   : undefined;
 
+// ── Instructions (delivery-aware) ────────────────────────────────────────
+const instructions = `You are Athena. You wake from one external event, act once, then exit.
+
+The event envelope is in your prompt: { source, type, threadId, data }.
+
+${isSlack
+  ? `DELIVERY: your response text is automatically STREAMED to the user as you
+generate it. Do NOT call any "reply" tool — your message body IS the response.`
+  : `DELIVERY: call \`reply(text)\` once with your final response. The framework
+delivers it to the user.`}
+
+Tools:
+  • thread(limit?)  — fetch recent messages in the current thread for context.
+  • shell(cmd)      — escape hatch for anything else (reactions, user lookups,
+                      cross-channel posts, attachments, etc.). Skills live in
+                      $SKILLS_DIR; \`cat $SKILLS_DIR/<name>/SKILL.md\` tells
+                      you how to invoke each.
+
+Rules:
+  1. For typical mentions/DMs, just generate the response text. Don't inspect
+     skills when a plain reply is enough.
+  2. Use thread first only if you need conversation context to answer well.
+  3. Use shell only when streaming text and thread can't do the job.
+  4. Never reply to your own messages (data.user / data.bot_id). The adapter
+     already filters self-events but verify if in doubt.
+  5. Be concise. Markdown is rendered.`;
+
+const tools = isSlack ? { thread, shell } : { reply, thread, shell };
+
 const athena = new Agent({
   name: "athena",
   instructions,
   model: "openrouter/deepseek/deepseek-v3.2",
-  tools: { reply, thread, shell },
+  tools,
   memory,
 });
 
-const r = await athena.generate(
-  `Event envelope:\n${JSON.stringify(event, null, 2)}`,
-  {
+const prompt = `Event envelope:\n${JSON.stringify(event, null, 2)}`;
+
+// ── Slack streaming path ─────────────────────────────────────────────────
+if (isSlack) {
+  // 1. Open a live stream message in the thread.
+  const start = await slackApi("chat.startStream", {
+    channel: event.data.channel,
+    thread_ts: event.data.thread_id,
+    recipient_team_id: event.data.team,
+    recipient_user_id: event.data.user,
+  });
+  if (!start.ok) {
+    console.error(`[stream] startStream failed: ${start.error}`);
+    process.exit(1);
+  }
+  const messageTs = start.ts as string;
+  console.log(`[stream] start ts=${messageTs}`);
+
+  // 2. Buffer agent deltas; flush every 80 chars OR 250ms.
+  let buf = "";
+  let lastFlush = Date.now();
+  const flush = async () => {
+    if (!buf) return;
+    const chunk = buf;
+    buf = "";
+    const r = await slackApi("chat.appendStream", {
+      channel: event.data.channel,
+      ts: messageTs,
+      markdown_text: chunk,
+    });
+    if (!r.ok) console.error(`[stream] append failed: ${r.error}`);
+    lastFlush = Date.now();
+  };
+
+  // 3. Stream from the agent.
+  const result = await athena.stream(prompt, {
     maxSteps: 6,
     threadId: event.threadId,
-    resourceId: "athena",                 // single agent identity for now
-  },
-);
-console.log("[agent] done:", r.text.slice(0, 400));
+    resourceId: "athena",
+  } as any);
+
+  for await (const delta of (result as any).textStream as AsyncIterable<string>) {
+    buf += delta;
+    if (buf.length >= 80 || Date.now() - lastFlush > 250) await flush();
+  }
+  await flush();
+
+  // 4. Finalize.
+  const stop = await slackApi("chat.stopStream", {
+    channel: event.data.channel,
+    ts: messageTs,
+  });
+  console.log(`[stream] stop ok=${stop.ok} err=${stop.error ?? "-"}`);
+} else {
+  // ── Non-streaming path (non-Slack sources) ────────────────────────────
+  const r = await athena.generate(prompt, {
+    maxSteps: 6,
+    threadId: event.threadId,
+    resourceId: "athena",
+  });
+  console.log("[agent] done:", r.text.slice(0, 400));
+}
