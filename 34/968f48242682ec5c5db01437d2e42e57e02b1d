@@ -1,0 +1,27 @@
+agent.package.json
+  s_ea4a84106416f8::t_4cdc4fba4f17a6 9-10
+lib/spawn.ts
+  s_ea4a84106416f8::t_7d6f66583ee5d2 126,139
+agent.ts
+  s_ea4a84106416f8::t_eae34127f0c0ec 190,195
+  s_ea4a84106416f8::t_79643b5494f006 201
+  s_ea4a84106416f8::t_b145675b45d25f 12-40
+  s_ea4a84106416f8::t_9052cbd6315b60 184-187
+  s_ea4a84106416f8::t_c58be6054c03cf 199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "34968f48242682ec5c5db01437d2e42e57e02b1d",
+  "prompts": {},
+  "sessions": {
+    "s_ea4a84106416f8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efcd6044-89b5-465e-8c67-00455de98fdd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "charitra-prem <charitra@premai.io>"
+    }
+  }
+}
