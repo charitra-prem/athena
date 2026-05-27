@@ -1,0 +1,19 @@
+api/sign-in.ts
+  s_dcff5ba0b39035::t_ba1ecebccd9cb0 9-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "60624bbc987681f7122ec58f7adafa143cd9652f",
+  "prompts": {},
+  "sessions": {
+    "s_dcff5ba0b39035": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf0dccc6-454c-418f-a592-238278b46f2f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "charitra-prem <charitra@premai.io>"
+    }
+  }
+}
