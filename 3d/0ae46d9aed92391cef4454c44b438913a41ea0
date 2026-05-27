@@ -1,0 +1,42 @@
+agent.ts
+  s_ea4a84106416f8::t_9759676dac4c4d 155-175,181,186-190
+  s_ea4a84106416f8::t_11485f9e903fb9 10-11,21
+vercel.json
+  s_ea4a84106416f8::t_da3397ffe5f754 6,11
+.gitignore
+  s_ea4a84106416f8::t_c6ea060ba1bb15 9
+lib/kv.ts
+  s_ea4a84106416f8::t_37839a2eed4b1a 24
+  s_ea4a84106416f8::t_9898c1b56b220c 8-9,11-12,22
+  s_ea4a84106416f8::t_ca40cf733057b4 1-7,10,13-21,23,25-32,37-57
+  s_ea4a84106416f8::t_7dd874f1e14d01 33-36
+api/sources/slack.ts
+  s_ea4a84106416f8::t_215385977a4826 77-81,85,88,101-105
+lib/spawn.ts
+  s_ea4a84106416f8::t_0c7ecda6553051 147-148
+  s_ea4a84106416f8::t_a645e74bd0d97f 1-14,21,24-28,33,37-78,81-91,93-97,102-133,135-145,150-151,154-155,158-165,167-178,182-184
+  s_ea4a84106416f8::t_f283f4f780deb9 79-80
+  s_ea4a84106416f8::t_4a2fb492a7f9a1 152,166,179-181,185-187
+agent.package.json
+  s_ea4a84106416f8::t_2e75a4b0467135 9-10
+api/wake.ts
+  s_ea4a84106416f8::t_3a2ae09f0c3b81 7-13,27,33-39
+package.json
+  s_ea4a84106416f8::t_d0980cfdf613ed 6-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3d0ae46d9aed92391cef4454c44b438913a41ea0",
+  "prompts": {},
+  "sessions": {
+    "s_ea4a84106416f8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efcd6044-89b5-465e-8c67-00455de98fdd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "charitra-prem <charitra@premai.io>"
+    }
+  }
+}
