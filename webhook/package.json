@@ -6,7 +6,8 @@
     "presync": "cp ../agent.ts ./agent.ts",
     "sync": "echo synced",
     "predeploy": "npm run presync",
-    "deploy": "vercel deploy --prod --yes"
+    "deploy": "vercel deploy --prod --yes",
+    "typecheck": "tsc --noEmit --module nodenext --moduleResolution nodenext --target es2022 --strict --skipLibCheck --esModuleInterop api/wake.ts api/sources/slack.ts api/sources/nango.ts lib/spawn.ts"
   },
   "dependencies": {
     "@vercel/functions": "^3.6.0",
@@ -16,6 +17,7 @@
   "devDependencies": {
     "@types/ms": "^2.1.0",
     "@types/node": "^22.10.0",
-    "@vercel/node": "^5.8.5"
+    "@vercel/node": "^5.8.5",
+    "typescript": "^5.6.3"
   }
 }

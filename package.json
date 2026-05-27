@@ -5,7 +5,8 @@
   "scripts": {
     "spawn": "tsx --env-file=.env spawn.ts",
     "status": "tsx --env-file=.env status.ts",
-    "dashboard": "tsx --env-file=.env dashboard.ts"
+    "dashboard": "tsx --env-file=.env dashboard.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@vercel/sandbox": "^1.10.2",
