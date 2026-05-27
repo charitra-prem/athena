@@ -12,21 +12,10 @@ concurrency:
 jobs:
   typecheck:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [".", "webhook"]
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      - name: Install deps
-        working-directory: ${{ matrix.package }}
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: ${{ matrix.package }}
-        run: bun run typecheck
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck

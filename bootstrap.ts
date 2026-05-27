@@ -3,11 +3,7 @@
 import { Sandbox } from "@vercel/sandbox";
 import { readFileSync } from "node:fs";
 import ms from "ms";
-
-const cleanFetch: typeof fetch = (input, init) => {
-  const { dispatcher: _, ...rest } = (init ?? {}) as any;
-  return fetch(input as any, rest);
-};
+import { cleanFetch } from "./lib/clean-fetch.js";
 
 const pkg = readFileSync(new URL("./agent.package.json", import.meta.url), "utf8");
 

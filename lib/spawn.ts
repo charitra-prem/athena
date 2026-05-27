@@ -5,11 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ms from "ms";
-
-const cleanFetch: typeof fetch = (input, init) => {
-  const { dispatcher: _, ...rest } = (init ?? {}) as any;
-  return fetch(input as any, rest);
-};
+import { cleanFetch } from "./clean-fetch.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AGENT_CODE = readFileSync(join(__dirname, "..", "agent.ts"), "utf8");

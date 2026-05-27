@@ -5,11 +5,6 @@
       "maxDuration": 60,
       "includeFiles": "agent.ts"
     },
-    "api/sources/nango.ts": {
-      "memory": 512,
-      "maxDuration": 60,
-      "includeFiles": "agent.ts"
-    },
     "api/sources/slack.ts": {
       "memory": 512,
       "maxDuration": 60,
