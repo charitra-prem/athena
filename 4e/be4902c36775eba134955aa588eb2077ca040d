@@ -1,0 +1,23 @@
+package.json
+  s_ea4a84106416f8::t_098e4803fce220 8-9
+.github/workflows/ci.yml
+  s_ea4a84106416f8::t_9f7155501517a8 1-32
+webhook/package.json
+  s_ea4a84106416f8::t_c4413cf3c32a1f 9-10,20-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4ebe4902c36775eba134955aa588eb2077ca040d",
+  "prompts": {},
+  "sessions": {
+    "s_ea4a84106416f8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efcd6044-89b5-465e-8c67-00455de98fdd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "charitra-prem <charitra@premai.io>"
+    }
+  }
+}
