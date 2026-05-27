@@ -9,10 +9,11 @@ import { cleanFetch } from "./clean-fetch.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AGENT_CODE = readFileSync(join(__dirname, "..", "agent.ts"), "utf8");
+// skills/ ships inside the snapshot (see bootstrap.ts). Not uploaded per-spawn.
 
 export type Envelope = {
-  source: string;            // e.g. "nango-gmail", "slack-events", "composio-gmail"
-  type: string;              // e.g. "new-email", "message", "reaction"
+  source: string;
+  type: string;
   data: Record<string, unknown>;
 };
 
@@ -27,12 +28,13 @@ export async function spawnSandbox(event: Envelope): Promise<{ sandboxId: string
     resources: { vcpus: 2 },
     timeout: ms("5m"),
     env: {
-      COMPOSIO_API_KEY: process.env.COMPOSIO_API_KEY!,
+      COMPOSIO_API_KEY: process.env.COMPOSIO_API_KEY ?? "",
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY!,
-      AGENT_USER_ID: process.env.AGENT_USER_ID!,
-      AGENT_EMAIL: process.env.AGENT_EMAIL!,
+      AGENT_USER_ID: process.env.AGENT_USER_ID ?? "",
+      AGENT_EMAIL: process.env.AGENT_EMAIL ?? "",
       SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN ?? "",
       SLACK_BOT_USER_ID: process.env.SLACK_BOT_USER_ID ?? "",
+      SKILLS_DIR: "/vercel/sandbox/skills",
       EVENT_PAYLOAD: JSON.stringify(event),
     },
     networkPolicy: {
@@ -40,11 +42,13 @@ export async function spawnSandbox(event: Envelope): Promise<{ sandboxId: string
         "openrouter.ai": [], "*.openrouter.ai": [],
         "backend.composio.dev": [], "*.composio.dev": [],
         "slack.com": [], "*.slack.com": [],
+        "*.googleapis.com": [],
       },
     },
   });
 
   await sb.writeFiles([{ path: "agent.ts", content: AGENT_CODE }]);
+
   await sb.runCommand({
     cmd: "node",
     args: ["--experimental-strip-types", "agent.ts"],

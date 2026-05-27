@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// Slack CLI — thin wrapper over the Web API. Auth via $SLACK_BOT_TOKEN.
+// All output is JSON on stdout. Exit codes: 0 ok, 1 api error, 2 usage.
+
+const TOKEN = process.env.SLACK_BOT_TOKEN;
+if (!TOKEN) {
+  console.error(JSON.stringify({ error: "SLACK_BOT_TOKEN missing in env" }));
+  process.exit(2);
+}
+
+const args = process.argv.slice(2);
+const cmd = args.shift();
+
+function takeFlag(name) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  return args.splice(i, 2)[1];
+}
+
+async function call(method, params, { get = false } = {}) {
+  const url = `https://slack.com/api/${method}` + (get ? `?${new URLSearchParams(params)}` : "");
+  const r = await fetch(url, {
+    method: get ? "GET" : "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    ...(get ? {} : { body: JSON.stringify(params) }),
+  });
+  const j = await r.json();
+  console.log(JSON.stringify(j, null, 2));
+  process.exit(j.ok ? 0 : 1);
+}
+
+async function main() {
+  if (cmd === "send") {
+    const channel = args[0];
+    const text = args[1];
+    const thread_ts = takeFlag("--thread-ts");
+    if (!channel || !text) usage("send <channel> <text> [--thread-ts <ts>]");
+    return call("chat.postMessage", { channel, text, ...(thread_ts ? { thread_ts } : {}) });
+  }
+  if (cmd === "list") {
+    const channel = args[0];
+    const thread_ts = takeFlag("--thread-ts");
+    const limit = takeFlag("--limit") ?? "20";
+    if (!channel) usage("list <channel> [--thread-ts <ts>] [--limit N]");
+    const method = thread_ts ? "conversations.replies" : "conversations.history";
+    const params = { channel, limit, ...(thread_ts ? { ts: thread_ts } : {}) };
+    return call(method, params, { get: true });
+  }
+  if (cmd === "react") {
+    const channel = args[0], ts = args[1], name = args[2];
+    if (!channel || !ts || !name) usage("react <channel> <ts> <emoji>");
+    return call("reactions.add", { channel, timestamp: ts, name });
+  }
+  if (cmd === "raw") {
+    const method = args[0];
+    const params = args[1] ? JSON.parse(args[1]) : {};
+    if (!method) usage("raw <method> '<json-params>'");
+    return call(method, params);
+  }
+  usage("send|list|react|raw …");
+}
+
+function usage(msg) {
+  console.error(JSON.stringify({ error: "usage: slack " + msg }));
+  process.exit(2);
+}
+
+main().catch((e) => {
+  console.error(JSON.stringify({ error: e?.message ?? String(e) }));
+  process.exit(1);
+});

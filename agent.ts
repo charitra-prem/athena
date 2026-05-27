@@ -1,23 +1,27 @@
-// Runs INSIDE the Vercel Sandbox, ONCE per event. Receives a normalized
-// envelope { source, type, data } in EVENT_PAYLOAD, decides, acts, exits.
+// Runs INSIDE the Vercel Sandbox, ONCE per event. Reads a normalized envelope
+// { source, type, data } from EVENT_PAYLOAD, acts, exits.
+//
+// Tools (priority order):
+//   reply   — post a reply in-thread. The 99% case.
+//   thread  — fetch recent messages in the current thread for context.
+//   shell   — escape hatch. Skills live in $SKILLS_DIR (slack, google, …).
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
 import { z } from "zod";
+
+const exec = promisify(execCb);
 
 type Envelope = {
   source: string;
   type: string;
   data: {
-    message_id?: string | null;
-    thread_id?: string | null;
-    subject?: string | null;
-    sender?: string | null;
-    snippet?: string | null;
     channel?: string | null;
+    thread_id?: string | null;
     user?: string | null;
     text?: string | null;
-    team?: string | null;
-    raw?: unknown;
+    [k: string]: unknown;
   };
 };
 
@@ -26,114 +30,134 @@ if (!event) {
   console.error("no EVENT_PAYLOAD");
   process.exit(1);
 }
+console.log(`[evt] source=${event.source} type=${event.type}`);
 
-const { source, type, data } = event;
-console.log(`[evt] source=${source} type=${type} mid=${data.message_id ?? "?"} tid=${data.thread_id ?? "?"}`);
-
-const isSlack = source.startsWith("slack-");
-const isGmail = source.startsWith("gmail-") || source.startsWith("composio-") || source.startsWith("nango-google-mail");
-
-if (isGmail) {
-  const sender = (data.sender ?? "").toString();
-  if (sender.toLowerCase().includes((process.env.AGENT_EMAIL ?? "").toLowerCase())) {
-    console.log("[skip] self-gmail:", sender);
-    process.exit(0);
-  }
-}
-if (isSlack) {
-  const botId = process.env.SLACK_BOT_USER_ID ?? "";
-  if (botId && data.user === botId) {
-    console.log("[skip] self-slack:", data.user);
-    process.exit(0);
-  }
+async function slackApi(method: string, params: Record<string, any>, get = false) {
+  const url = `https://slack.com/api/${method}` + (get ? `?${new URLSearchParams(params)}` : "");
+  const r = await fetch(url, {
+    method: get ? "GET" : "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    ...(get ? {} : { body: JSON.stringify(params) }),
+  });
+  return (await r.json()) as { ok: boolean; error?: string; [k: string]: any };
 }
 
-const slackReply = createTool({
-  id: "slack_reply_in_thread",
-  description: "Post a reply in the same Slack thread as the incoming event.",
-  inputSchema: z.object({ text: z.string().describe("The message body to send.") }),
+const reply = createTool({
+  id: "reply",
+  description:
+    "Post a reply in-thread to whoever triggered this event. Use this for normal responses.",
+  inputSchema: z.object({
+    text: z.string().describe("The reply text. Be concise."),
+  }),
   execute: async (input: any) => {
-    console.log("[slack_reply] input keys:", Object.keys(input ?? {}), "raw=", JSON.stringify(input).slice(0, 300));
-    // Mastra has shipped a few shapes here; tolerate them all.
-    const text =
-      input?.context?.text ??
-      input?.input?.text ??
-      input?.text ??
-      "";
-    console.log("[slack_reply] posting to", data.channel, "thread", data.thread_id, "text=", text.slice(0, 80));
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort("timeout-10s"), 10_000);
-    try {
-      const r = await fetch("https://slack.com/api/chat.postMessage", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-          "Content-Type": "application/json; charset=utf-8",
-        },
-        body: JSON.stringify({
-          channel: data.channel,
-          thread_ts: data.thread_id,
-          text,
-        }),
-        signal: ctrl.signal,
+    const text: string = input?.text ?? input?.context?.text ?? "";
+    if (event.source.startsWith("slack-")) {
+      const j = await slackApi("chat.postMessage", {
+        channel: event.data.channel,
+        thread_ts: event.data.thread_id,
+        text,
       });
-      console.log("[slack_reply] http status=" + r.status);
-      const bodyText = await r.text();
-      console.log("[slack_reply] body=" + bodyText.slice(0, 300));
-      const j = JSON.parse(bodyText) as { ok: boolean; ts?: string; channel?: string; error?: string };
-      if (!j.ok) return { error: j.error, ok: false };
-      return { ts: j.ts, channel: j.channel, ok: true };
+      console.log(`[reply] slack ok=${j.ok} ts=${j.ts ?? "-"} err=${j.error ?? "-"}`);
+      return j.ok ? { ok: true, ts: j.ts } : { ok: false, error: j.error };
+    }
+    return { ok: false, error: `unsupported source: ${event.source}` };
+  },
+});
+
+const thread = createTool({
+  id: "thread",
+  description:
+    "Fetch recent messages from the current thread for context. Returns up to `limit` messages.",
+  inputSchema: z.object({
+    limit: z.number().int().min(1).max(50).optional().describe("Default 20."),
+  }),
+  execute: async (input: any) => {
+    const limit: number = input?.limit ?? input?.context?.limit ?? 20;
+    if (event.source.startsWith("slack-")) {
+      const j = await slackApi(
+        "conversations.replies",
+        { channel: event.data.channel, ts: event.data.thread_id, limit: String(limit) },
+        true,
+      );
+      if (!j.ok) return { ok: false, error: j.error };
+      const messages = (j.messages ?? []).map((m: any) => ({
+        ts: m.ts,
+        user: m.user ?? m.bot_id ?? null,
+        text: m.text,
+      }));
+      console.log(`[thread] slack got ${messages.length} messages`);
+      return { ok: true, messages };
+    }
+    return { ok: false, error: `unsupported source: ${event.source}` };
+  },
+});
+
+const shell = createTool({
+  id: "shell",
+  description:
+    "Run a shell command (bash -c). Use ONLY when reply/thread are insufficient — e.g., " +
+    "reacting with an emoji, fetching user info, posting to a different channel, attaching " +
+    "files, anything else. Skills live in $SKILLS_DIR (e.g. slack); read $SKILLS_DIR/<name>/SKILL.md " +
+    "for usage. Returns { stdout, stderr, exit }. 20s timeout.",
+  inputSchema: z.object({
+    cmd: z.string(),
+  }),
+  execute: async (input: any) => {
+    const cmd: string = input?.cmd ?? input?.context?.cmd ?? "";
+    console.log(`[shell] $ ${cmd}`);
+    try {
+      const { stdout, stderr } = await exec(cmd, {
+        env: process.env,
+        timeout: 20_000,
+        maxBuffer: 1024 * 1024,
+        shell: "/bin/bash",
+      });
+      return { stdout, stderr, exit: 0 };
     } catch (e: any) {
-      console.log("[slack_reply] error:", e?.message ?? e);
-      return { error: e?.message ?? String(e), ok: false };
-    } finally {
-      clearTimeout(to);
+      return {
+        stdout: e?.stdout ?? "",
+        stderr: e?.stderr ?? e?.message ?? "",
+        exit: typeof e?.code === "number" ? e.code : 1,
+      };
     }
   },
 });
 
-let tools: Record<string, any> = {};
-if (isSlack) {
-  tools = { slack_reply_in_thread: slackReply };
-}
-if (isGmail) {
-  console.log("[tools] loading composio gmail...");
-  const { Composio } = await import("@composio/core");
-  const { VercelProvider } = await import("@composio/vercel");
-  const composio = new Composio({
-    apiKey: process.env.COMPOSIO_API_KEY!,
-    provider: new VercelProvider(),
-  });
-  tools = await composio.tools.get(process.env.AGENT_USER_ID!, { toolkits: ["GMAIL"] });
-  console.log("[tools] gmail loaded");
-}
+const instructions = `You are Athena. You wake from one external event, act once, then exit.
 
-const instructions = `You are Athena. You wake from external events and act once per wake.
+The event envelope is in your prompt: { source, type, data }.
 
-Event source: ${source}
-Event type: ${type}
+You have three tools:
+  • reply(text)     — post a reply in-thread to whoever triggered this event.
+  • thread(limit?)  — fetch recent messages in the current thread for context.
+  • shell(cmd)      — escape hatch for anything else (reactions, user lookups,
+                      cross-channel posts, file attachments, etc.). Skills are
+                      in $SKILLS_DIR; \`cat $SKILLS_DIR/<name>/SKILL.md\` tells
+                      you how to invoke each.
 
-${isGmail ? `GMAIL RULES:
-- SAFETY GATE: only reply if subject contains "[athena]" (case-insensitive). Otherwise no tool calls.
-- When the gate passes: reply in-thread via GMAIL_REPLY_TO_THREAD.
-- You are ${process.env.AGENT_EMAIL}.` : ""}
+Rules:
+  1. For typical mentions/DMs, call reply once and stop. Don't inspect skills
+     when a plain reply is enough — that's wasted turns.
+  2. Use thread first only if you need conversation context to answer well.
+  3. Use shell only when reply/thread cannot do the job.
+  4. After a successful reply, produce a one-line final message and stop.
+     Do not call more tools.
+  5. Never reply to your own messages (data.user, data.sender, data.bot_id).
+     The adapter already filters self-events but verify if in doubt.
+  6. Be concise.`;
 
-${isSlack ? `SLACK RULES:
-- For app_mention events: reply in-thread via slack_reply_in_thread. Always reply — the user explicitly addressed you.
-- For plain message.im (direct messages): reply via slack_reply_in_thread.
-- Be concise (1–2 sentences unless asked for detail).` : ""}
-
-Decide based on the event, take at most one action, then stop.`;
-
-console.log("[agent] generating...");
 const athena = new Agent({
   name: "athena",
   instructions,
   model: "openrouter/deepseek/deepseek-v3.2",
-  tools,
+  tools: { reply, thread, shell },
 });
 
 const r = await athena.generate(
-  `Incoming event:\n${JSON.stringify(event, null, 2)}\n\nApply the rules for this source and decide.`,
+  `Event envelope:\n${JSON.stringify(event, null, 2)}`,
+  { maxSteps: 6 },
 );
 console.log("[agent] done:", r.text.slice(0, 400));
