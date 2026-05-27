@@ -123,6 +123,7 @@ export async function spawnSandbox(event: Envelope): Promise<{
       env: {
         COMPOSIO_API_KEY: process.env.COMPOSIO_API_KEY ?? "",
         OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY!,
+        OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? "",
         AGENT_USER_ID: process.env.AGENT_USER_ID ?? "",
         AGENT_EMAIL: process.env.AGENT_EMAIL ?? "",
         SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN ?? "",
@@ -135,6 +136,7 @@ export async function spawnSandbox(event: Envelope): Promise<{
       networkPolicy: {
         allow: {
           "openrouter.ai": [], "*.openrouter.ai": [],
+          "api.openai.com": [],
           "backend.composio.dev": [], "*.composio.dev": [],
           "slack.com": [], "*.slack.com": [],
           "*.googleapis.com": [],

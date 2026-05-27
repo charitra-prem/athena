@@ -9,6 +9,35 @@ import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
 import { UpstashStore, UpstashVector } from "@mastra/upstash";
+// Minimal AI-SDK-compatible embedder that hits OpenRouter's /embeddings
+// endpoint. Mastra's Memory.embedder only calls .doEmbed(), so this is all
+// that's required. No external package needed.
+const openrouterEmbedder = {
+  specificationVersion: "v1" as const,
+  provider: "openrouter",
+  modelId: "openai/text-embedding-3-small",
+  maxEmbeddingsPerCall: 64,
+  supportsParallelCalls: true,
+  async doEmbed({ values }: { values: string[] }) {
+    const r = await fetch("https://openrouter.ai/api/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "openai/text-embedding-3-small",
+        input: values,
+      }),
+    });
+    const j = (await r.json()) as any;
+    if (j.error) throw new Error(`openrouter embed: ${j.error.message ?? JSON.stringify(j.error)}`);
+    return {
+      embeddings: j.data.map((d: any) => d.embedding as number[]),
+      usage: { tokens: j.usage?.total_tokens ?? 0 },
+    };
+  },
+};
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
@@ -152,21 +181,24 @@ Rules:
      The adapter already filters self-events but verify if in doubt.
   6. Be concise.`;
 
-// Observational memory: conversation history + per-thread working memory +
-// semantic recall, all backed by the same Upstash instance our control plane
-// uses for sandbox/snapshot state. Keyed by event.threadId.
-const memory = process.env.UPSTASH_REDIS_REST_URL
+// Observational memory: lastMessages + semanticRecall + workingMemory,
+// keyed by event.threadId. Both inference and embeddings go through
+// OpenRouter (one provider, one key).
+const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
   ? new Memory({
       storage: new UpstashStore({
+        id: "athena-store",
         url: process.env.UPSTASH_REDIS_REST_URL!,
         token: process.env.UPSTASH_REDIS_REST_TOKEN!,
       }),
       vector: new UpstashVector({
+        id: "athena-vector",
         url: process.env.UPSTASH_REDIS_REST_URL!,
         token: process.env.UPSTASH_REDIS_REST_TOKEN!,
       }),
+      embedder: openrouterEmbedder as any,
       options: {
-        lastMessages: 10,                 // inject last 10 messages every turn
+        lastMessages: 10,
         semanticRecall: { topK: 3, messageRange: 2 },
         workingMemory: { enabled: true },
       },
