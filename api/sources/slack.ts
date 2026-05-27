@@ -74,12 +74,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // ACK Slack immediately — fire-and-forget the spawn
       res.status(200).json({ ok: true });
 
+      // Canonical thread id — survives across messages in the same Slack thread,
+      // and is what KV / snapshots / Mastra Memory are keyed off.
+      const threadRoot = ev.thread_ts ?? ev.ts;
+      const threadId = `slack:${body.team_id}:${ev.channel}:${threadRoot}`;
+
       const envelope = {
         source: "slack-events",
         type: ev.type, // "app_mention" | "message"
+        threadId,
         data: {
           message_id: ev.client_msg_id ?? ev.ts ?? null,
-          thread_id: ev.thread_ts ?? ev.ts ?? null,
+          thread_id: threadRoot,
           channel: ev.channel ?? null,
           user: ev.user ?? null,
           text: ev.text ?? null,
@@ -92,7 +98,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // spawn alive past the response.
       waitUntil(
         spawnSandbox(envelope)
-          .then((s) => console.log(`[slack] spawned ${s.sandboxId} in ${s.bootMs}ms`))
+          .then((s) =>
+            console.log(
+              `[slack] sbx=${s.sandboxId} reused=${s.reused} dirty=${s.dirty} total=${s.totalMs}ms`,
+            ),
+          )
           .catch((e) => console.error("[slack] spawn failed:", e?.message ?? e)),
       );
       return;

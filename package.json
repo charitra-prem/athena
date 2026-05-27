@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bootstrap": "tsx --env-file=.env bootstrap.ts",
+    "build:agent": "bun build agent.ts --outfile=.build/agent.js --target=node --format=esm --external '*'",
+    "bootstrap": "bun run build:agent && tsx --env-file=.env bootstrap.ts",
+    "predeploy": "bun run build:agent",
     "deploy": "vercel deploy --prod --yes",
     "typecheck": "tsc --noEmit"
   },

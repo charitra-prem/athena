@@ -7,6 +7,8 @@
 //   shell   — escape hatch. Skills live in $SKILLS_DIR (slack, google, …).
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
+import { Memory } from "@mastra/memory";
+import { UpstashStore, UpstashVector } from "@mastra/upstash";
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
@@ -16,6 +18,7 @@ const exec = promisify(execCb);
 type Envelope = {
   source: string;
   type: string;
+  threadId: string;
   data: {
     channel?: string | null;
     thread_id?: string | null;
@@ -149,15 +152,41 @@ Rules:
      The adapter already filters self-events but verify if in doubt.
   6. Be concise.`;
 
+// Observational memory: conversation history + per-thread working memory +
+// semantic recall, all backed by the same Upstash instance our control plane
+// uses for sandbox/snapshot state. Keyed by event.threadId.
+const memory = process.env.UPSTASH_REDIS_REST_URL
+  ? new Memory({
+      storage: new UpstashStore({
+        url: process.env.UPSTASH_REDIS_REST_URL!,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+      }),
+      vector: new UpstashVector({
+        url: process.env.UPSTASH_REDIS_REST_URL!,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+      }),
+      options: {
+        lastMessages: 10,                 // inject last 10 messages every turn
+        semanticRecall: { topK: 3, messageRange: 2 },
+        workingMemory: { enabled: true },
+      },
+    })
+  : undefined;
+
 const athena = new Agent({
   name: "athena",
   instructions,
   model: "openrouter/deepseek/deepseek-v3.2",
   tools: { reply, thread, shell },
+  memory,
 });
 
 const r = await athena.generate(
   `Event envelope:\n${JSON.stringify(event, null, 2)}`,
-  { maxSteps: 6 },
+  {
+    maxSteps: 6,
+    threadId: event.threadId,
+    resourceId: "athena",                 // single agent identity for now
+  },
 );
 console.log("[agent] done:", r.text.slice(0, 400));

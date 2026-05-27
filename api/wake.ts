@@ -4,7 +4,13 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { spawnSandbox, type Envelope } from "../lib/spawn.js";
 
 function isEnvelope(b: any): b is Envelope {
-  return b && typeof b.source === "string" && typeof b.type === "string" && b.data && typeof b.data === "object";
+  return (
+    b &&
+    typeof b.source === "string" &&
+    typeof b.type === "string" &&
+    typeof b.threadId === "string" &&
+    b.data && typeof b.data === "object"
+  );
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -18,14 +24,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!isEnvelope(req.body)) {
       return res.status(400).json({
-        error: "expected envelope { source, type, data }",
+        error: "expected envelope { source, type, threadId, data }",
         hint: "vendor-shaped payloads should POST to /api/sources/{vendor}",
         got: req.body,
       });
     }
 
-    const { sandboxId, bootMs } = await spawnSandbox(req.body);
-    res.status(200).json({ sandboxId, bootMs, source: req.body.source, type: req.body.type });
+    const result = await spawnSandbox(req.body);
+    res.status(200).json({
+      ...result,
+      source: req.body.source,
+      type: req.body.type,
+      threadId: req.body.threadId,
+    });
   } catch (e: any) {
     res.status(500).json({ error: e?.message ?? String(e), stack: e?.stack?.split("\n").slice(0, 6) });
   }

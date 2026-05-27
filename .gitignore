@@ -6,4 +6,5 @@ node_modules/
 .vercel/
 dist/
 build/
+.build/
 .vercel
