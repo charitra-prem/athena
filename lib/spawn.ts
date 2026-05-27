@@ -24,8 +24,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const AGENT_CODE = readFileSync(join(__dirname, "..", ".build", "agent.js"), "utf8");
 
 const BASE_SNAPSHOT = process.env.SANDBOX_SNAPSHOT_ID!;
-const KEEP_ALIVE_MS = 60_000;          // reuse window for follow-ups
-const SANDBOX_TIMEOUT_MS = 90_000;     // sandbox hard timeout — must exceed KEEP_ALIVE_MS
+const KEEP_ALIVE_MS = 5 * 60_000;      // warm-reuse window for follow-ups
+const SANDBOX_TIMEOUT_MS = 10 * 60_000; // sandbox hard timeout — must exceed KEEP_ALIVE_MS
 
 export type Envelope = {
   source: string;

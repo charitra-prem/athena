@@ -39,7 +39,50 @@ await sb.writeFiles([
 ]);
 console.log(`copied ${skillFiles.length} skill file(s)`);
 
-console.log("installing deps…");
+// ── Coding-agent toolchain ─────────────────────────────────────────────
+// dnf-installable utilities + static binaries (rg/fd/gh) into /usr/local/bin.
+// Versions are pinned; bump as needed.
+const RG_VERSION = "14.1.1";
+const FD_VERSION = "10.2.0";
+const GH_VERSION = "2.66.1";
+
+const toolchainScript = `set -euo pipefail
+sudo dnf install -y --setopt=install_weak_deps=False --quiet jq tree make
+
+cd /tmp
+echo "[bootstrap] downloading ripgrep ${RG_VERSION}"
+curl -sSLf "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar -xz
+sudo install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+
+echo "[bootstrap] downloading fd ${FD_VERSION}"
+curl -sSLf "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd-v${FD_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar -xz
+sudo install -m 0755 "fd-v${FD_VERSION}-x86_64-unknown-linux-musl/fd" /usr/local/bin/fd
+
+echo "[bootstrap] downloading gh ${GH_VERSION}"
+curl -sSLf "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | tar -xz
+sudo install -m 0755 "gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh
+
+rm -rf /tmp/ripgrep-* /tmp/fd-v* /tmp/gh_*
+
+echo "[bootstrap] verifying:"
+rg --version | head -1
+fd --version
+gh --version | head -1
+jq --version
+
+mkdir -p /vercel/sandbox/work
+`;
+
+console.log("installing coding-agent toolchain…");
+const tools = await sb.runCommand({
+  cmd: "bash",
+  args: ["-c", toolchainScript],
+  stdout: process.stdout,
+  stderr: process.stderr,
+});
+if (tools.exitCode !== 0) throw new Error(`toolchain install failed: exit ${tools.exitCode}`);
+
+console.log("installing npm deps…");
 const install = await sb.runCommand({
   cmd: "npm",
   args: ["install", "--no-audit", "--no-fund", "--loglevel=error"],

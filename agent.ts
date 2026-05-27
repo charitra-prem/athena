@@ -14,17 +14,26 @@
 //                  are scoped to the resource, so what Athena learns in one
 //                  thread is available in every thread of the same channel.
 //
-// One tool: bash. Everything beyond "generate text" — thread context,
-// file edits, builds, tests, package installs, skills — flows through it.
+// Tools (coding-agent suite):
+//   bash   — full shell escape hatch (pipes, sudo, redirects).
+//   read   — read a file with line numbers.
+//   write  — create or overwrite a file (parent dirs auto-created).
+//   edit   — exact string replacement (errors on ambiguity).
+//   grep   — content search via ripgrep.
+//   glob   — file discovery via fd.
+// Skills under $SKILLS_DIR expose higher-level helpers (slack, etc.).
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
 import { UpstashStore, UpstashVector } from "@mastra/upstash";
-import { exec as execCb } from "node:child_process";
+import { exec as execCb, execFile as execFileCb } from "node:child_process";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 
 const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 
 // ── OpenRouter embedder (AI-SDK-compatible) ──────────────────────────────
 const openrouterEmbedder = {
@@ -97,16 +106,23 @@ const isSlack = event.source.startsWith("slack-");
 // State between calls: the bash tool spawns a new shell per invocation, so
 // `cd`, `export`, etc. do NOT persist. Use absolute paths and pass `cwd`.
 const BASH_WORK_DIR = "/vercel/sandbox/work";
-const BASH_DEFAULT_TIMEOUT_MS = 60_000;
-const BASH_MAX_TIMEOUT_MS = 75_000; // sandbox itself dies at SANDBOX_TIMEOUT_MS
+const BASH_DEFAULT_TIMEOUT_MS = 2 * 60_000;       // 2 min
+const BASH_MAX_TIMEOUT_MS = 9 * 60_000;           // sandbox dies at 10 min (SANDBOX_TIMEOUT_MS)
+
+// Paths in tool inputs are resolved relative to the work dir if not absolute,
+// so the agent doesn't have to keep typing /vercel/sandbox/work everywhere.
+function resolvePath(p?: string): string {
+  if (!p) return BASH_WORK_DIR;
+  return isAbsolute(p) ? p : resolve(BASH_WORK_DIR, p);
+}
 
 const bash = createTool({
   id: "bash",
   description:
     "Run a bash command. Full shell: pipes, redirects, subshells, heredocs, " +
-    "globs. Standard tools available (cat, ls, find, grep, sed, awk, git, " +
-    "node, npm, python3, curl, jq if installed, etc.). `sudo` works without " +
-    "a password — install packages with `sudo dnf install -y <pkg>`. " +
+    "globs. Standard tools available (cat, ls, find, grep, sed, awk, jq, " +
+    "tree, make, git, gh, node, npm, python3, curl, rg, fd, …). `sudo` works " +
+    "without a password — install more packages with `sudo dnf install -y <pkg>`. " +
     `Default cwd is ${BASH_WORK_DIR} (auto-created); pass \`cwd\` to override. ` +
     `Default timeout ${BASH_DEFAULT_TIMEOUT_MS / 1000}s (max ${BASH_MAX_TIMEOUT_MS / 1000}s). ` +
     "A fresh shell is spawned per call — `cd` and `export` don't persist; " +
@@ -152,6 +168,180 @@ const bash = createTool({
   },
 });
 
+// ── File tools ───────────────────────────────────────────────────────────
+const read = createTool({
+  id: "read",
+  description:
+    "Read a file from disk with 1-indexed line numbers (like `cat -n`). " +
+    "Relative paths are resolved against /vercel/sandbox/work. For large " +
+    "files, pass `offset` and `limit` to page through.",
+  inputSchema: z.object({
+    path: z.string(),
+    offset: z.number().int().min(1).optional().describe("Starting line (1-indexed). Default 1."),
+    limit: z.number().int().min(1).max(5000).optional().describe("Max lines. Default 2000."),
+  }),
+  execute: async (input: any) => {
+    const ctx = input?.context ?? input ?? {};
+    const path = resolvePath(ctx.path);
+    const offset: number = ctx.offset ?? 1;
+    const limit: number = ctx.limit ?? 2000;
+    try {
+      const content = await readFile(path, "utf8");
+      const lines = content.split("\n");
+      const slice = lines.slice(offset - 1, offset - 1 + limit);
+      const width = String(offset + slice.length - 1).length;
+      const numbered = slice
+        .map((l, i) => `${String(offset + i).padStart(width)}\t${l}`)
+        .join("\n");
+      return {
+        ok: true,
+        path,
+        total_lines: lines.length,
+        showing: `${offset}-${offset + slice.length - 1}`,
+        content: numbered,
+      };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  },
+});
+
+const write = createTool({
+  id: "write",
+  description:
+    "Write content to a file, overwriting if it exists. Parent directories " +
+    "are created automatically. Relative paths resolve against the work dir.",
+  inputSchema: z.object({
+    path: z.string(),
+    content: z.string(),
+  }),
+  execute: async (input: any) => {
+    const ctx = input?.context ?? input ?? {};
+    const path = resolvePath(ctx.path);
+    const content: string = ctx.content ?? "";
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf8");
+      return { ok: true, path, bytes: Buffer.byteLength(content, "utf8") };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  },
+});
+
+const edit = createTool({
+  id: "edit",
+  description:
+    "Replace exact text in a file. `old_string` MUST match exactly. By " +
+    "default it must appear exactly ONCE in the file; if it appears multiple " +
+    "times the call errors so you can add surrounding context to make it " +
+    "unique. Set `replace_all: true` to replace every occurrence (use for " +
+    "renames). Always re-read the file after editing to confirm.",
+  inputSchema: z.object({
+    path: z.string(),
+    old_string: z.string(),
+    new_string: z.string(),
+    replace_all: z.boolean().optional(),
+  }),
+  execute: async (input: any) => {
+    const ctx = input?.context ?? input ?? {};
+    const path = resolvePath(ctx.path);
+    const oldStr: string = ctx.old_string ?? "";
+    const newStr: string = ctx.new_string ?? "";
+    const all = ctx.replace_all === true;
+    if (oldStr === "") return { ok: false, error: "old_string must be non-empty" };
+    try {
+      const content = await readFile(path, "utf8");
+      const occurrences = content.split(oldStr).length - 1;
+      if (occurrences === 0) return { ok: false, error: "old_string not found" };
+      if (!all && occurrences > 1) {
+        return {
+          ok: false,
+          error: `old_string appears ${occurrences} times; add context to make it unique, or pass replace_all`,
+        };
+      }
+      const next = all ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
+      await writeFile(path, next, "utf8");
+      return { ok: true, path, replacements: all ? occurrences : 1 };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  },
+});
+
+const grep = createTool({
+  id: "grep",
+  description:
+    "Search file contents with ripgrep. Returns matches with file:line:text. " +
+    "Respects .gitignore. `pattern` is a regex. Path defaults to the work dir.",
+  inputSchema: z.object({
+    pattern: z.string().describe("Regex pattern."),
+    path: z.string().optional(),
+    glob: z.string().optional().describe("Filter files by glob (e.g. '*.ts')."),
+    case_insensitive: z.boolean().optional(),
+    context_lines: z.number().int().min(0).max(10).optional(),
+    max_count: z.number().int().min(1).max(1000).optional().describe("Default 200."),
+  }),
+  execute: async (input: any) => {
+    const ctx = input?.context ?? input ?? {};
+    const args: string[] = ["--line-number", "--with-filename", "--color=never"];
+    if (ctx.case_insensitive) args.push("-i");
+    if (typeof ctx.context_lines === "number" && ctx.context_lines > 0) {
+      args.push(`-C${ctx.context_lines}`);
+    }
+    args.push(`-m${ctx.max_count ?? 200}`);
+    if (ctx.glob) args.push("-g", ctx.glob);
+    args.push("--", ctx.pattern, resolvePath(ctx.path));
+    try {
+      const { stdout } = await execFile("rg", args, {
+        env: process.env,
+        timeout: 60_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      return { ok: true, matches: stdout };
+    } catch (e: any) {
+      // rg exit 1 == no matches (not an error)
+      if (e?.code === 1 && !e?.stderr) return { ok: true, matches: "" };
+      return { ok: false, error: e?.stderr ?? e?.message ?? String(e), exit: e?.code };
+    }
+  },
+});
+
+const glob = createTool({
+  id: "glob",
+  description:
+    "Find files matching a glob pattern with fd. Returns a list of paths. " +
+    "Respects .gitignore by default. Path defaults to the work dir.",
+  inputSchema: z.object({
+    pattern: z.string().describe("Glob (e.g. '*.ts', '**/*.tsx')."),
+    path: z.string().optional(),
+    include_hidden: z.boolean().optional(),
+    type: z.enum(["file", "dir"]).optional(),
+    max_results: z.number().int().min(1).max(2000).optional().describe("Default 500."),
+  }),
+  execute: async (input: any) => {
+    const ctx = input?.context ?? input ?? {};
+    const args: string[] = ["--glob", ctx.pattern];
+    if (ctx.include_hidden) args.push("-H");
+    if (ctx.type === "file") args.push("-tf");
+    else if (ctx.type === "dir") args.push("-td");
+    args.push("--max-results", String(ctx.max_results ?? 500));
+    args.push(".");
+    try {
+      const { stdout } = await execFile("fd", args, {
+        cwd: resolvePath(ctx.path),
+        env: process.env,
+        timeout: 30_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const paths = stdout.split("\n").filter(Boolean);
+      return { ok: true, count: paths.length, paths };
+    } catch (e: any) {
+      return { ok: false, error: e?.stderr ?? e?.message ?? String(e), exit: e?.code };
+    }
+  },
+});
+
 // ── Memory ────────────────────────────────────────────────────────────────
 const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
   ? new Memory({
@@ -183,37 +373,46 @@ DELIVERY: your response text is automatically STREAMED to the user as you
 generate it. Just produce the answer as your text — do NOT call any tool
 to deliver it.
 
-Tool:
-  • bash(cmd, cwd?, timeout?) — full bash with pipes, redirects, heredocs,
-    globs. Use it for everything that isn't generating your response: reading
-    files, editing code, running tests, installing packages (\`sudo dnf
-    install -y <pkg>\`), git operations, hitting APIs with curl, invoking
-    skills. \`cd\` and \`export\` do NOT persist between calls — pass \`cwd\`
-    instead, and use absolute paths.
+Tools (prefer the structured ones over raw bash where they apply):
+  • read(path, offset?, limit?)         — line-numbered file view.
+  • write(path, content)                — create/overwrite (parent dirs auto).
+  • edit(path, old_string, new_string, replace_all?)
+                                        — exact string replacement; errors
+                                          unless old_string is unique (or
+                                          replace_all=true).
+  • grep(pattern, path?, glob?, …)      — ripgrep over file contents.
+  • glob(pattern, path?, …)             — fd over file paths.
+  • bash(cmd, cwd?, timeout?)           — full shell escape hatch (pipes,
+                                          redirects, sudo, dnf, git, gh,
+                                          curl, npm, tests, builds). \`cd\`
+                                          and \`export\` do NOT persist
+                                          between calls — pass \`cwd\`.
 
 Working as a coding agent:
-  • Default workdir is /vercel/sandbox/work — clone, edit, build, test there.
-  • Read files: \`cat -n path/to/file\`. Search: \`grep -rn 'pat' path\`.
-    List: \`ls -la\` or \`find path -type f\`.
-  • Edit small changes via heredocs/sed; for big rewrites, write a temp
-    script and run it. Always re-read the file after editing to verify.
-  • Run tests / lints before claiming success. Capture stderr; non-zero
-    exit codes are failures, surface them.
-  • Long-running things (installs, builds) can take ~60s. Pass a \`timeout\`
-    up to 75000 if you need more, or break work into smaller steps.
+  • Default workdir is /vercel/sandbox/work. Paths in read/write/edit/grep/
+    glob are resolved against it if not absolute. Clone, edit, build, test
+    inside it.
+  • Inspect before editing. Use read/grep/glob to understand the code first.
+  • Re-read the file after edit() to confirm. If edit complains old_string
+    isn't unique, widen the snippet — don't fall back to sed.
+  • Run tests/lints before claiming a change works. Surface non-zero exits.
+  • Need git/gh? Use bash. The \`gh\` CLI needs auth (\`gh auth login --with-token\`)
+    if you want to push or open PRs.
+  • Long-running things (npm install, builds, test suites) can take minutes.
+    bash defaults to 2 min; pass \`timeout\` up to 540000 (9 min) if needed.
 
-Slack / channel actions go through skills:
+Slack / channel-side actions go through skills:
   • \`cat $SKILLS_DIR/<name>/SKILL.md\` for usage of each skill (slack, etc.).
 
 Rules:
   1. For typical questions, just generate the answer text. Don't reach for
-     bash unless you actually need to inspect/change something.
+     tools unless you actually need to inspect or change something.
   2. Fetch thread context only if you can't answer well without it.
   3. Never respond to your own messages (data.user / data.bot_id). The
      adapter filters self-events but verify if in doubt.
   4. Be concise. Markdown is rendered.`;
 
-const tools = { bash };
+const tools = { bash, read, write, edit, grep, glob };
 
 const athena = new Agent({
   name: "athena",
