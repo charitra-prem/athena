@@ -287,25 +287,15 @@ bun run bootstrap
 #   prints: SANDBOX_SNAPSHOT_ID=snap_…
 # Add it to .env.
 
-# d. Push every runtime var to Vercel (production scope)
-for v in VERCEL_TOKEN VERCEL_TEAM_ID VERCEL_PROJECT_ID SANDBOX_SNAPSHOT_ID \
-         OPENROUTER_API_KEY UPSTASH_REDIS_REST_URL UPSTASH_REDIS_REST_TOKEN \
-         SLACK_SIGNING_SECRET SLACK_BOT_TOKEN SLACK_BOT_USER_ID INGEST_SECRET; do
-  vercel env add "$v" production
-done
-
-# e. Deploy (predeploy hook runs build:agent → .build/agent.js)
+# d. Deploy (predeploy hook runs build:agent → .build/agent.js, env vars)
 bun run deploy
 #   note the production URL, e.g. https://athena-foo.vercel.app
 
-# f. Wire Slack
+# e. Wire Slack
 #   Go to api.slack.com → Your App → Event Subscriptions
 #   Request URL: https://<deployment>/api/sources/slack
 #   Slack POSTs a url_verification challenge; the adapter echoes the challenge back.
 
-# g. Smoke test (from inside the sandbox an agent could run; or curl directly)
-node skills/slack/bin/slack send C0B78ND1LQG "hi from local"
-# Then @-mention the bot in Slack and watch `vercel logs --follow`.
 ```
 
 ---
