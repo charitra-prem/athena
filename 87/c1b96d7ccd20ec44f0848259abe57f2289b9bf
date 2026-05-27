@@ -1,0 +1,24 @@
+agent.ts
+  s_ea4a84106416f8::t_58ca727fdec6a9 2,4-12,17-23,37,48,58,83-85,89-91,94-96,110,116,137-140,162,184-212,217,221-256,259-282
+README.md
+  s_ea4a84106416f8::t_3cccc212071860 3,5-7,11-15,17-45,47-49,53-66,69-74,77-81,83,86,89-91,94-275,277-371,374-383,385-391,393-401,404-420,422,424,426-431
+api/sources/slack.ts
+  s_ea4a84106416f8::t_65a380cddc520e 75-80,87-108
+  s_ea4a84106416f8::t_8f8174db7514c0 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "87c1b96d7ccd20ec44f0848259abe57f2289b9bf",
+  "prompts": {},
+  "sessions": {
+    "s_ea4a84106416f8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "efcd6044-89b5-465e-8c67-00455de98fdd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "charitra-prem <charitra@premai.io>"
+    }
+  }
+}
