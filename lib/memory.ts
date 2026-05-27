@@ -70,7 +70,10 @@ export async function hydrate(
   const contents = await Promise.all(
     allBlobs.map(async (b) => ({
       blob: b,
-      text: await fetch(b.url).then((r) => r.text()),
+      // cache: no-store so we always read the latest version after a recent
+      // PUT. Vercel Blob URLs are stable but the CDN can briefly serve stale
+      // bytes when an immediate read follows a write.
+      text: await fetch(b.url, { cache: "no-store" }).then((r) => r.text()),
     })),
   );
 
