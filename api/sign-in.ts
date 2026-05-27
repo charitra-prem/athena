@@ -6,7 +6,8 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 export default function handler(req: VercelRequest, res: VercelResponse) {
   const slack = typeof req.query.slack === "string" ? req.query.slack : "";
-  const pk = process.env.CLERK_PUBLISHABLE_KEY ?? "";
+  // .trim() to drop any stray newline some env stores can append on paste.
+  const pk = (process.env.CLERK_PUBLISHABLE_KEY ?? "").trim();
   if (!slack || !slack.includes(":")) {
     return res.status(400).send("missing or malformed ?slack=<team>:<user>");
   }
