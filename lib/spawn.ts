@@ -31,6 +31,7 @@ export type Envelope = {
   source: string;
   type: string;
   threadId: string;                    // canonical: "<source>:<source-key>"
+  resourceId: string;                  // project scope (e.g. "slack:<team>:<channel>")
   data: Record<string, unknown>;
 };
 

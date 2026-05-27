@@ -2,14 +2,20 @@
 // { source, type, threadId, data } from EVENT_PAYLOAD, acts, exits.
 //
 // Slack-events path: streams the agent's response live via Slack's
-// chat.startStream / chat.appendStream / chat.stopStream API. No reply tool
-// needed — the agent's text IS the stream.
-// Non-Slack sources: fall back to `chat.postMessage`-style "reply" tool.
+// chat.startStream / chat.appendStream / chat.stopStream API. The agent's
+// text IS the delivery — no reply tool needed.
+// Non-Slack sources: agent text is generated, logged, and (today) discarded.
+// When a new source adapter lands, wire its delivery here.
 //
-// Tools (always available):
-//   reply  — post the full final message at once. Used for non-streaming sources.
-//   thread — fetch recent thread messages for context.
-//   shell  — escape hatch. Skills live in $SKILLS_DIR.
+// Memory has two scopes:
+//   - threadId   = one conversation (e.g. one Slack thread)
+//   - resourceId = the project around it (e.g. the channel) — shared by every
+//                  thread in the same place. workingMemory + semanticRecall
+//                  are scoped to the resource, so what Athena learns in one
+//                  thread is available in every thread of the same channel.
+//
+// One tool: bash. Everything beyond "generate text" — thread context,
+// file edits, builds, tests, package installs, skills — flows through it.
 import { Agent } from "@mastra/core/agent";
 import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
@@ -49,7 +55,8 @@ const openrouterEmbedder = {
 type Envelope = {
   source: string;
   type: string;
-  threadId: string;
+  threadId: string;          // "slack:<team>:<channel>:<thread_root>"
+  resourceId: string;        // project scope, e.g. "slack:<team>:<channel>"
   data: {
     channel?: string | null;
     thread_id?: string | null;
@@ -82,77 +89,63 @@ async function slackApi(method: string, params: Record<string, any>, get = false
 
 const isSlack = event.source.startsWith("slack-");
 
-// ── Tools ────────────────────────────────────────────────────────────────
-const reply = createTool({
-  id: "reply",
-  description:
-    "Post a full reply at once. ONLY used for non-Slack sources today — Slack " +
-    "events stream the response automatically; do not call this tool there.",
-  inputSchema: z.object({ text: z.string() }),
-  execute: async (input: any) => {
-    const text: string = input?.text ?? input?.context?.text ?? "";
-    if (isSlack) {
-      // Fallback: shouldn't be hit (we stream the response separately), but
-      // in case the agent calls it anyway, deliver as plain message.
-      const j = await slackApi("chat.postMessage", {
-        channel: event.data.channel,
-        thread_ts: event.data.thread_id,
-        text,
-      });
-      return j.ok ? { ok: true, ts: j.ts } : { ok: false, error: j.error };
-    }
-    return { ok: false, error: `unsupported source: ${event.source}` };
-  },
-});
+// ── Tool ─────────────────────────────────────────────────────────────────
+// One tool: bash. Replies are streamed (Slack) or returned as text (others).
+// Anything else — reading/writing files, running tests, installing packages,
+// invoking skills, hitting APIs via curl — goes through bash.
+//
+// State between calls: the bash tool spawns a new shell per invocation, so
+// `cd`, `export`, etc. do NOT persist. Use absolute paths and pass `cwd`.
+const BASH_WORK_DIR = "/vercel/sandbox/work";
+const BASH_DEFAULT_TIMEOUT_MS = 60_000;
+const BASH_MAX_TIMEOUT_MS = 75_000; // sandbox itself dies at SANDBOX_TIMEOUT_MS
 
-const thread = createTool({
-  id: "thread",
-  description: "Fetch recent messages from the current thread for context.",
+const bash = createTool({
+  id: "bash",
+  description:
+    "Run a bash command. Full shell: pipes, redirects, subshells, heredocs, " +
+    "globs. Standard tools available (cat, ls, find, grep, sed, awk, git, " +
+    "node, npm, python3, curl, jq if installed, etc.). `sudo` works without " +
+    "a password — install packages with `sudo dnf install -y <pkg>`. " +
+    `Default cwd is ${BASH_WORK_DIR} (auto-created); pass \`cwd\` to override. ` +
+    `Default timeout ${BASH_DEFAULT_TIMEOUT_MS / 1000}s (max ${BASH_MAX_TIMEOUT_MS / 1000}s). ` +
+    "A fresh shell is spawned per call — `cd` and `export` don't persist; " +
+    "use absolute paths or pass `cwd`. Skills under $SKILLS_DIR provide " +
+    "higher-level helpers; `cat $SKILLS_DIR/<name>/SKILL.md` for each. " +
+    "Returns { stdout, stderr, exit }; output capped at 10MB.",
   inputSchema: z.object({
-    limit: z.number().int().min(1).max(50).optional().describe("Default 20."),
+    cmd: z.string().describe("The bash command to run."),
+    cwd: z.string().optional().describe(`Working directory. Default ${BASH_WORK_DIR}.`),
+    timeout: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(BASH_MAX_TIMEOUT_MS)
+      .optional()
+      .describe(`Override timeout in ms (default ${BASH_DEFAULT_TIMEOUT_MS}).`),
   }),
   execute: async (input: any) => {
-    const limit: number = input?.limit ?? input?.context?.limit ?? 20;
-    if (isSlack) {
-      const j = await slackApi(
-        "conversations.replies",
-        { channel: event.data.channel, ts: event.data.thread_id, limit: String(limit) },
-        true,
-      );
-      if (!j.ok) return { ok: false, error: j.error };
-      const messages = (j.messages ?? []).map((m: any) => ({
-        ts: m.ts,
-        user: m.user ?? m.bot_id ?? null,
-        text: m.text,
-      }));
-      return { ok: true, messages };
-    }
-    return { ok: false, error: `unsupported source: ${event.source}` };
-  },
-});
-
-const shell = createTool({
-  id: "shell",
-  description:
-    "Run a bash command. Use for anything not covered by streaming reply or thread — " +
-    "reactions, user lookups, cross-channel posts, file attachments. Skills live in " +
-    "$SKILLS_DIR (cat $SKILLS_DIR/<name>/SKILL.md). 20s timeout.",
-  inputSchema: z.object({ cmd: z.string() }),
-  execute: async (input: any) => {
-    const cmd: string = input?.cmd ?? input?.context?.cmd ?? "";
-    console.log(`[shell] $ ${cmd}`);
+    const ctx = input?.context ?? input ?? {};
+    const cmd: string = ctx.cmd ?? "";
+    const cwd: string = ctx.cwd ?? BASH_WORK_DIR;
+    const timeout: number = ctx.timeout ?? BASH_DEFAULT_TIMEOUT_MS;
+    console.log(`[bash] (${cwd}) $ ${cmd}`);
     try {
+      // Ensure cwd exists. Cheap; mkdir -p is a no-op when present.
+      await exec(`mkdir -p ${JSON.stringify(cwd)}`, { shell: "/bin/bash" });
       const { stdout, stderr } = await exec(cmd, {
+        cwd,
         env: process.env,
-        timeout: 20_000,
-        maxBuffer: 1024 * 1024,
+        timeout,
+        maxBuffer: 10 * 1024 * 1024,
         shell: "/bin/bash",
       });
       return { stdout, stderr, exit: 0 };
     } catch (e: any) {
+      const killed = e?.killed === true || e?.signal === "SIGTERM";
       return {
         stdout: e?.stdout ?? "",
-        stderr: e?.stderr ?? e?.message ?? "",
+        stderr: (e?.stderr ?? "") + (killed ? `\n[bash] killed after ${timeout}ms` : ""),
         exit: typeof e?.code === "number" ? e.code : 1,
       };
     }
@@ -174,9 +167,9 @@ const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
       }),
       embedder: openrouterEmbedder as any,
       options: {
-        lastMessages: 10,
-        semanticRecall: { topK: 3, messageRange: 2 },
-        workingMemory: { enabled: true },
+        lastMessages: 10,                                          // thread-scoped (always)
+        semanticRecall: { topK: 3, messageRange: 2, scope: "resource" },
+        workingMemory: { enabled: true, scope: "resource" },
       },
     })
   : undefined;
@@ -184,31 +177,43 @@ const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
 // ── Instructions (delivery-aware) ────────────────────────────────────────
 const instructions = `You are Athena. You wake from one external event, act once, then exit.
 
-The event envelope is in your prompt: { source, type, threadId, data }.
+The event envelope is in your prompt: { source, type, threadId, resourceId, data }.
 
-${isSlack
-  ? `DELIVERY: your response text is automatically STREAMED to the user as you
-generate it. Do NOT call any "reply" tool — your message body IS the response.`
-  : `DELIVERY: call \`reply(text)\` once with your final response. The framework
-delivers it to the user.`}
+DELIVERY: your response text is automatically STREAMED to the user as you
+generate it. Just produce the answer as your text — do NOT call any tool
+to deliver it.
 
-Tools:
-  • thread(limit?)  — fetch recent messages in the current thread for context.
-  • shell(cmd)      — escape hatch for anything else (reactions, user lookups,
-                      cross-channel posts, attachments, etc.). Skills live in
-                      $SKILLS_DIR; \`cat $SKILLS_DIR/<name>/SKILL.md\` tells
-                      you how to invoke each.
+Tool:
+  • bash(cmd, cwd?, timeout?) — full bash with pipes, redirects, heredocs,
+    globs. Use it for everything that isn't generating your response: reading
+    files, editing code, running tests, installing packages (\`sudo dnf
+    install -y <pkg>\`), git operations, hitting APIs with curl, invoking
+    skills. \`cd\` and \`export\` do NOT persist between calls — pass \`cwd\`
+    instead, and use absolute paths.
+
+Working as a coding agent:
+  • Default workdir is /vercel/sandbox/work — clone, edit, build, test there.
+  • Read files: \`cat -n path/to/file\`. Search: \`grep -rn 'pat' path\`.
+    List: \`ls -la\` or \`find path -type f\`.
+  • Edit small changes via heredocs/sed; for big rewrites, write a temp
+    script and run it. Always re-read the file after editing to verify.
+  • Run tests / lints before claiming success. Capture stderr; non-zero
+    exit codes are failures, surface them.
+  • Long-running things (installs, builds) can take ~60s. Pass a \`timeout\`
+    up to 75000 if you need more, or break work into smaller steps.
+
+Slack / channel actions go through skills:
+  • \`cat $SKILLS_DIR/<name>/SKILL.md\` for usage of each skill (slack, etc.).
 
 Rules:
-  1. For typical mentions/DMs, just generate the response text. Don't inspect
-     skills when a plain reply is enough.
-  2. Use thread first only if you need conversation context to answer well.
-  3. Use shell only when streaming text and thread can't do the job.
-  4. Never reply to your own messages (data.user / data.bot_id). The adapter
-     already filters self-events but verify if in doubt.
-  5. Be concise. Markdown is rendered.`;
+  1. For typical questions, just generate the answer text. Don't reach for
+     bash unless you actually need to inspect/change something.
+  2. Fetch thread context only if you can't answer well without it.
+  3. Never respond to your own messages (data.user / data.bot_id). The
+     adapter filters self-events but verify if in doubt.
+  4. Be concise. Markdown is rendered.`;
 
-const tools = isSlack ? { thread, shell } : { reply, thread, shell };
+const tools = { bash };
 
 const athena = new Agent({
   name: "athena",
@@ -256,7 +261,7 @@ if (isSlack) {
   const result = await athena.stream(prompt, {
     maxSteps: 6,
     threadId: event.threadId,
-    resourceId: "athena",
+    resourceId: event.resourceId,
   } as any);
 
   for await (const delta of (result as any).textStream as AsyncIterable<string>) {
@@ -276,7 +281,7 @@ if (isSlack) {
   const r = await athena.generate(prompt, {
     maxSteps: 6,
     threadId: event.threadId,
-    resourceId: "athena",
+    resourceId: event.resourceId,
   });
   console.log("[agent] done:", r.text.slice(0, 400));
 }

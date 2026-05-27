@@ -37,9 +37,9 @@ Athena is a long-running AI agent that wakes on external events (Slack mentions 
    │  ─ skills/ (baked in)    │         │  threadId, "athena"    │
    │  ─ node_modules/         │         └────────────────────────┘
    │                          │
-   │  Tools: reply, thread,   │  ───▶ reply: Slack chat.postMessage
-   │         shell            │  ───▶ thread: conversations.replies
-   │                          │  ───▶ shell: $SKILLS_DIR/<name>/bin/<name> …
+   │  Slack: stream agent.text │  ───▶ chat.startStream / appendStream /
+   │         to chat.*Stream   │       stopStream (text streams live)
+   │  Tool: shell              │  ───▶ skills under $SKILLS_DIR (slack, …)
    └────────────┬─────────────┘
                 │  exit
                 ▼
@@ -69,24 +69,22 @@ State map:
 type Envelope = {
   source: string;        // "slack-events", later "gmail-pubsub", …
   type: string;          // "app_mention", "message", …
-  threadId: string;      // canonical, source-qualified
+  threadId: string;      // one conversation
+  resourceId: string;    // the "project" around it (channel-scoped for Slack)
   data: Record<string, unknown>;
 };
 ```
 
-`threadId` canonicalization (from `api/sources/slack.ts`):
+Canonicalization (from `api/sources/slack.ts`):
 
-```
-slack:<team_id>:<channel>:<thread_root_ts>
-```
+| Field        | Form                                                     | Example                                          |
+| ------------ | -------------------------------------------------------- | ------------------------------------------------ |
+| `threadId`   | `slack:<team_id>:<channel>:<thread_root_ts>`             | `slack:T123:C0B78ND1LQG:1779872551.798819`       |
+| `resourceId` | `slack:<team_id>:<channel>` (no thread root)             | `slack:T123:C0B78ND1LQG`                         |
 
-For a top-level message in channel `C0B78ND1LQG` with ts `1779872551.798819` in team `T123`:
+Every thread in the same channel shares the same `resourceId`. Memory's `workingMemory` and `semanticRecall` are scoped to `resourceId`, so cross-thread context within a channel is recallable; `lastMessages` is `threadId`-scoped (verbatim tail of just this conversation).
 
-```
-slack:T123:C0B78ND1LQG:1779872551.798819
-```
-
-Future sources should use the same `<source>:<source-specific-stable-key>` form. Anything that should reuse memory / a sandbox snapshot across messages MUST map to the same `threadId`.
+Future sources should use the same `<source>:<source-specific-stable-key>` form for both. Anything that should reuse memory / a sandbox snapshot across messages MUST map to the same `threadId`.
 
 POSTing a raw envelope to `/api/wake` (bypassing the adapter) is supported and intended for smoke tests:
 
@@ -94,7 +92,7 @@ POSTing a raw envelope to `/api/wake` (bypassing the adapter) is supported and i
 curl -sS -X POST https://<deployment>/api/wake \
   -H 'content-type: application/json' \
   -H "x-ingest-secret: $INGEST_SECRET" \
-  -d '{"source":"manual","type":"ping","threadId":"manual:test1","data":{"text":"hi"}}'
+  -d '{"source":"manual","type":"ping","threadId":"manual:t1","resourceId":"manual:default","data":{"text":"hi"}}'
 ```
 
 ---
@@ -154,23 +152,45 @@ Embeddings go through **OpenRouter's `/embeddings` endpoint** (`openai/text-embe
 
 Inference also goes through OpenRouter (`openrouter/deepseek/deepseek-v3.2`). One key (`OPENROUTER_API_KEY`) covers both inference and embeddings.
 
-Memory is keyed by `event.threadId` (canonical, per Section 2) and `resourceId: "athena"` (a single shared identity — there's only one Athena agent for now).
+Memory has **two scopes**, both per envelope:
+
+| Key          | Granularity                                | What's scoped to it                     |
+| ------------ | ------------------------------------------ | --------------------------------------- |
+| `threadId`   | one conversation (e.g. one Slack thread)   | `lastMessages` (verbatim recent tail)   |
+| `resourceId` | the "project" around it (e.g. the channel) | `workingMemory` + `semanticRecall` pool |
+
+`resourceId` for Slack is `slack:<team>:<channel>` — every thread in the same channel shares working-memory notes and is searchable via semantic recall. What Athena learns in one thread is therefore available to it in every other thread of the same channel.
 
 ---
 
 ## 5. Agent tools
 
-`agent.ts` exposes three tools to the model. Priority is encoded in the system prompt.
+`agent.ts` exposes exactly **one** tool to the model. Delivery happens
+outside the tool surface: for Slack events the agent's response text is
+streamed live via `chat.startStream` / `appendStream` / `stopStream` (the
+agent doesn't "call" a reply tool — it just generates text).
 
-| Tool     | Signature                            | When to use                                                                                  |
-| -------- | ------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `reply`  | `{ text: string }`                   | Post a reply in-thread. The 99% case. Routes to Slack `chat.postMessage` with `thread_ts`.   |
-| `thread` | `{ limit?: number }` (default 20)    | Fetch recent messages from the current thread for context. Routes to `conversations.replies`.|
-| `shell`  | `{ cmd: string }`                    | Escape hatch: reactions, user lookups, cross-channel posts, attachments, anything else. 20s timeout, bash. |
+| Tool    | Signature           | When to use                                                                                                                          |
+| ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `shell` | `{ cmd: string }`   | ANY action that isn't the response itself — fetching thread context, reactions, user lookups, cross-channel posts, files, npm. 20s. |
 
-The system prompt explicitly steers selection — `reply` for typical mentions, `thread` only if conversational context is needed, `shell` only when neither is sufficient. After a successful `reply`, the agent must emit one final assistant message and stop (`maxSteps: 6` is a hard ceiling).
+`shell` is bash inside the sandbox. Skills are how the agent invokes
+real services through it:
 
-Skills are **not** auto-loaded. The agent invokes them via `shell` when it decides to. The prompt instructs it to `cat $SKILLS_DIR/<name>/SKILL.md` first to learn the CLI.
+```sh
+# Fetch the thread's recent messages for context
+node $SKILLS_DIR/slack/bin/slack list <channel> --thread-ts <thread_id>
+
+# React with an emoji
+node $SKILLS_DIR/slack/bin/slack react <channel> <ts> <emoji>
+```
+
+The system prompt steers: just generate text for typical responses;
+reach for `shell` only when an action is needed beyond the answer.
+`maxSteps: 6` caps tool-use cycles.
+
+Skills are **not** auto-loaded. The agent runs `cat $SKILLS_DIR/<name>/SKILL.md`
+on first need to discover usage.
 
 ---
 
@@ -309,7 +329,7 @@ bun run deploy
    - Build the `Envelope` and call `waitUntil(spawnSandbox(envelope))` — never await before `res.end()`.
 2. **Register the function in `vercel.json`**: add the path under `functions` with `includeFiles: ".build/agent.js"` and a sensible `maxDuration` / `memory`.
 3. **Network policy**: if the agent will hit a new domain (e.g. `gmail.googleapis.com`), add it to `networkPolicy.allow` in `lib/spawn.ts`.
-4. **Agent tools**: if the new source needs source-specific tools (beyond the generic `reply` / `thread` / `shell`), extend `agent.ts`. Today `reply` and `thread` branch on `event.source.startsWith("slack-")` — add a parallel branch.
+4. **Delivery**: today only `slack-events` has wired delivery (streaming). For a new source, decide between (a) streaming via that vendor's equivalent API and wire it as an `else if (event.source.startsWith("<vendor>-"))` block in `agent.ts`, or (b) re-introduce a vendor-specific `reply` tool. Either way, only the `agent.ts` delivery block changes — the broker and KV layer stay untouched.
 5. Redeploy. No bootstrap re-run needed unless you also added a skill.
 
 ---
@@ -381,7 +401,7 @@ curl -sS -X POST "https://api.vercel.com/v1/sandboxes/<sandboxId>/stop?teamId=$V
   -H "Authorization: Bearer $VERCEL_TOKEN"
 ```
 
-Inside the sandbox, `agent.ts` prefixes log lines for grep-ability: `[evt] …`, `[reply] …`, `[thread] …`, `[shell] …`, `[agent] done: …`.
+Inside the sandbox, `agent.ts` prefixes log lines for grep-ability: `[evt] …`, `[stream] start ts=…`, `[stream] stop ok=…`, `[shell] $ …`, `[agent] done: …`.
 
 **KV inspection** — useful to debug "why didn't this reuse":
 
@@ -417,5 +437,5 @@ curl -sS "$UPSTASH_REDIS_REST_URL" \
 - **Slack chat streaming.** The agent calls `chat.postMessage` once at the end. Streaming partial output via `chat.update` is deferred this iteration.
 - **Snapshot GC sweeper for dormant threads.** KV entries expire after 7 days idle, but per-thread snapshots only get deleted on the *next* event for that thread. A standalone sweeper that lists snapshots and removes any whose KV entry is gone is the obvious next step.
 - **Cross-source threads.** Today `threadId` is `<source>:…`. A user who DMs the bot and then emails it shows up as two unrelated threads. Wiring a global identity index (e.g. by user email) would let memory span sources.
-- **Sub-agent spawning.** The agent has only `reply` / `thread` / `shell`. No structured tool for spawning a child agent / parallelizing work.
+- **Sub-agent spawning.** The agent has only `shell`. No structured tool for spawning a child agent / parallelizing work.
 - **Multi-step durable workflows.** Anything that needs retries, fan-out, or scheduled follow-ups (e.g. "remind me in 2 hours") should live on a real workflow engine — Inngest or Temporal are the right layer above this. Athena is event → act-once → exit, deliberately.

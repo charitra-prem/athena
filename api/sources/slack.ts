@@ -83,6 +83,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // and is what KV / snapshots / Mastra Memory are keyed off.
       const threadRoot = ev.thread_ts ?? ev.ts;
       const threadId = `slack:${body.team_id}:${ev.channel}:${threadRoot}`;
+      // Project = the Slack channel/group. Shared across all threads in it.
+      const resourceId = `slack:${body.team_id}:${ev.channel}`;
 
       // Follow-ups: a plain `message` event in a channel/group only triggers
       // Athena if (a) it's a thread reply (thread_ts set) AND (b) Athena has
@@ -111,6 +113,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         source: "slack-events",
         type: ev.type, // "app_mention" | "message"
         threadId,
+        resourceId,
         data: {
           message_id: ev.client_msg_id ?? ev.ts ?? null,
           thread_id: threadRoot,
