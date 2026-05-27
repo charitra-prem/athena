@@ -54,9 +54,11 @@ State map:
 
 | Concern                       | Lives in                              | Keyed by                  |
 | ----------------------------- | ------------------------------------- | ------------------------- |
-| Conversation history          | Upstash Redis + Vector (Mastra)       | `threadId`, `resourceId`  |
+| Conversation history (recency) | Upstash Redis + Vector (Mastra)      | `threadId`, `resourceId`  |
+| Durable memory (org/project/user) | Vercel Blob (`orgs/<orgId>/…`)   | `orgId`, `userId` (Clerk) |
+| Identity ↔ source mappings    | Upstash Redis (`org-link:…`, `user-link:…`) → Clerk | source-keyed |
 | Per-thread sandbox bookkeeping | Upstash Redis (`sandbox:<threadId>`) | `threadId`                |
-| Filesystem state (skills outputs, scratch files) | Vercel Sandbox snapshot   | `threadId` (one snap max) |
+| Per-thread filesystem (work/, scratch) | Vercel Sandbox snapshot       | `threadId` (one snap max) |
 | Base image (deps + skills)    | Vercel Sandbox snapshot               | `SANDBOX_SNAPSHOT_ID` env |
 
 ---
@@ -71,6 +73,7 @@ type Envelope = {
   type: string;          // "app_mention", "message", …
   threadId: string;      // one conversation
   resourceId: string;    // the "project" around it (channel-scoped for Slack)
+  orgId: string;         // the workspace / tenant boundary
   data: Record<string, unknown>;
 };
 ```
@@ -81,6 +84,7 @@ Canonicalization (from `api/sources/slack.ts`):
 | ------------ | -------------------------------------------------------- | ------------------------------------------------ |
 | `threadId`   | `slack:<team_id>:<channel>:<thread_root_ts>`             | `slack:T123:C0B78ND1LQG:1779872551.798819`       |
 | `resourceId` | `slack:<team_id>:<channel>` (no thread root)             | `slack:T123:C0B78ND1LQG`                         |
+| `orgId`      | `slack:<team_id>` (workspace boundary)                   | `slack:T123`                                     |
 
 Every thread in the same channel shares the same `resourceId`. Memory's `workingMemory` and `semanticRecall` are scoped to `resourceId`, so cross-thread context within a channel is recallable; `lastMessages` is `threadId`-scoped (verbatim tail of just this conversation).
 
@@ -92,7 +96,7 @@ POSTing a raw envelope to `/api/wake` (bypassing the adapter) is supported and i
 curl -sS -X POST https://<deployment>/api/wake \
   -H 'content-type: application/json' \
   -H "x-ingest-secret: $INGEST_SECRET" \
-  -d '{"source":"manual","type":"ping","threadId":"manual:t1","resourceId":"manual:default","data":{"text":"hi"}}'
+  -d '{"source":"manual","type":"ping","threadId":"manual:t1","resourceId":"manual:default","orgId":"manual","data":{"text":"hi"}}'
 ```
 
 ---
@@ -160,6 +164,28 @@ Memory has **two scopes**, both per envelope:
 | `resourceId` | the "project" around it (e.g. the channel) | `workingMemory` + `semanticRecall` pool |
 
 `resourceId` for Slack is `slack:<team>:<channel>` — every thread in the same channel shares working-memory notes and is searchable via semantic recall. What Athena learns in one thread is therefore available to it in every other thread of the same channel.
+
+### Durable memory (filesystem)
+
+Cross-thread, cross-event, cross-sandbox memory lives in **Vercel Blob** under `orgs/<orgId>/...` and is mounted into each sandbox at `/vercel/sandbox/memory/` per event:
+
+| Tier      | Blob namespace                          | Sandbox path                              |
+| --------- | --------------------------------------- | ----------------------------------------- |
+| Org       | `orgs/<orgId>/org/`                     | `/vercel/sandbox/memory/org/`             |
+| Project   | `orgs/<orgId>/projects/<channel>/`      | `/vercel/sandbox/memory/projects/...`     |
+| User      | `orgs/<orgId>/users/<userId>/`          | `/vercel/sandbox/memory/users/...`        |
+
+Lifecycle per event (in `lib/spawn.ts`):
+
+1. `resolveIdentity(envelope)` → `{ orgId, userId | null }`. `orgId` is the Clerk `org_id` if a link exists (`org-link:<orgId>` in KV → Clerk), else a fallback like `slack:T123`. `userId` is Clerk's `user_id` only when a `user-link:<orgId>:<sourceUser>` mapping exists.
+2. `hydrate(envelope, identity)` lists the three blob prefixes in parallel, fetches each accessible file, composes `memory/CONTEXT.md` (org/project/user `facts.md` inlined + manifest of the rest), and returns the bundle.
+3. Bundle is `sb.writeFiles`'d into the sandbox alongside `agent.js`.
+4. Agent boots, reads `/vercel/sandbox/memory/CONTEXT.md` and prepends it to its instructions; uses `read`/`write`/`edit`/`grep`/`glob` against `/vercel/sandbox/memory/` for any deeper memory access.
+5. After the agent exits successfully, `dehydrate(sb, envelope, identity, "/tmp/run-start")` runs `find -newer` against the memory tree and PUTs each modified file back to its blob key.
+
+RBAC is enforced by `canAccess(path, identity)` in `lib/identity.ts` — a 6-line pure function applied before every blob list/get and every blob put. The sandbox never holds Blob or Clerk credentials.
+
+`v1` write semantics: last-write-wins. A curator/compaction pass is the next iteration.
 
 ---
 
@@ -279,6 +305,10 @@ Three layers consume env: the local CLI (`bootstrap.ts`), the Vercel functions (
 | `SLACK_BOT_TOKEN`             | Vercel function + sandbox       | `agent.ts` (`slackApi`), `skills/slack/bin/slack`      | `xoxb-…`. Forwarded into sandbox.                                                      |
 | `SLACK_BOT_USER_ID`           | Vercel function + sandbox       | `api/sources/slack.ts` (self-event skip)               | `U…`. Forwarded into sandbox.                                                          |
 | `INGEST_SECRET`               | Vercel function                 | `api/wake.ts`                                          | Optional. If set, `x-ingest-secret` header must match.                                 |
+| `BLOB_READ_WRITE_TOKEN`       | Vercel function                 | `lib/memory.ts` (hydrate/dehydrate)                    | Vercel Blob store token. Broker only — never forwarded to the sandbox.                 |
+| `CLERK_PUBLISHABLE_KEY`       | Vercel function                 | `api/sign-in.tsx`                                      | Used only to derive the Clerk hosted sign-in URL.                                      |
+| `CLERK_SECRET_KEY`            | Vercel function                 | `lib/identity.ts` (org validation)                     | Broker only. Validates linked Clerk orgs; not needed when running unlinked.            |
+| `CLERK_WEBHOOK_SECRET`        | Vercel function                 | `api/clerk-webhook.ts`                                 | Svix shared secret for verifying inbound Clerk webhooks.                               |
 
 "Vercel function" = set via `vercel env add …` (production environment).
 "Sandbox" = forwarded into the sandbox by `lib/spawn.ts:spawnSandbox` — meaning **you set it on the Vercel function** and `spawn` propagates it. There is no separate sandbox env config.
@@ -439,3 +469,4 @@ curl -sS "$UPSTASH_REDIS_REST_URL" \
 - **Cross-source threads.** Today `threadId` is `<source>:…`. A user who DMs the bot and then emails it shows up as two unrelated threads. Wiring a global identity index (e.g. by user email) would let memory span sources.
 - **Sub-agent spawning.** The agent has only `shell`. No structured tool for spawning a child agent / parallelizing work.
 - **Multi-step durable workflows.** Anything that needs retries, fan-out, or scheduled follow-ups (e.g. "remind me in 2 hours") should live on a real workflow engine — Inngest or Temporal are the right layer above this. Athena is event → act-once → exit, deliberately.
+- **Slack OAuth install callback.** Deferred. Until then, use `scripts/seed-org-link.ts <slack-team-id> <clerk-org-id>` to manually link a Slack workspace to a Clerk org.
