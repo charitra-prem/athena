@@ -19,6 +19,8 @@ import { dirname, join } from "node:path";
 import ms from "ms";
 import { cleanFetch } from "./clean-fetch.js";
 import { kv } from "./kv.js";
+import { resolveIdentity } from "./identity.js";
+import { hydrate, dehydrate } from "./memory.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AGENT_CODE = readFileSync(join(__dirname, "..", ".build", "agent.js"), "utf8");
@@ -32,6 +34,7 @@ export type Envelope = {
   type: string;
   threadId: string;                    // canonical: "<source>:<source-key>"
   resourceId: string;                  // project scope (e.g. "slack:<team>:<channel>")
+  orgId: string;                       // org scope (e.g. "slack:<team>")
   data: Record<string, unknown>;
 };
 
@@ -150,6 +153,15 @@ export async function spawnSandbox(event: Envelope): Promise<{
   // Always re-upload agent.js — covers redeploys between reuses (5.7KB, cheap).
   await sb.writeFiles([{ path: "agent.js", content: AGENT_CODE }]);
 
+  // Resolve identity + hydrate durable memory.
+  const identity = await resolveIdentity(event);
+  const bundle = await hydrate(event, identity);
+  if (bundle.files.length > 0) {
+    await sb.writeFiles(
+      bundle.files.map((f) => ({ path: f.path, content: Buffer.from(f.content) })),
+    );
+  }
+
   // 3. Mark start and run the agent.
   await markRunStart(sb);
   const cmd = await sb.runCommand({
@@ -157,6 +169,17 @@ export async function spawnSandbox(event: Envelope): Promise<{
     args: ["agent.js"],
     env: { EVENT_PAYLOAD: JSON.stringify(event), THREAD_ID: event.threadId },
   });
+
+  // Push back any memory files the agent modified. Independent of the dirty check
+  // for /work — memory has its own persistence (object storage).
+  if (cmd.exitCode === 0) {
+    try {
+      const out = await dehydrate(sb, event, identity, "/tmp/run-start");
+      if (out.uploaded > 0) console.log(`[spawn] dehydrate uploaded=${out.uploaded}`);
+    } catch (e: any) {
+      console.error(`[spawn] dehydrate failed: ${e?.message ?? e}`);
+    }
+  }
 
   // 4. Decide whether to snapshot. Skip if reply-only (clean) or agent failed.
   const dirty = cmd.exitCode === 0 ? await detectDirty(sb) : false;

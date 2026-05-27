@@ -114,6 +114,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         type: ev.type, // "app_mention" | "message"
         threadId,
         resourceId,
+        orgId: `slack:${body.team_id}`,
         data: {
           message_id: ev.client_msg_id ?? ev.ts ?? null,
           thread_id: threadRoot,

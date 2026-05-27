@@ -10,6 +10,7 @@ function isEnvelope(b: any): b is Envelope {
     typeof b.type === "string" &&
     typeof b.threadId === "string" &&
     typeof b.resourceId === "string" &&
+    typeof b.orgId === "string" &&
     b.data && typeof b.data === "object"
   );
 }
@@ -25,7 +26,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (!isEnvelope(req.body)) {
       return res.status(400).json({
-        error: "expected envelope { source, type, threadId, resourceId, data }",
+        error: "expected envelope { source, type, threadId, resourceId, orgId, data }",
         hint: "vendor-shaped payloads should POST to /api/sources/{vendor}",
         got: req.body,
       });
@@ -38,6 +39,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       type: req.body.type,
       threadId: req.body.threadId,
       resourceId: req.body.resourceId,
+      orgId: req.body.orgId,
     });
   } catch (e: any) {
     res.status(500).json({ error: e?.message ?? String(e), stack: e?.stack?.split("\n").slice(0, 6) });

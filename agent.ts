@@ -27,6 +27,7 @@ import { createTool } from "@mastra/core/tools";
 import { Memory } from "@mastra/memory";
 import { UpstashStore, UpstashVector } from "@mastra/upstash";
 import { exec as execCb, execFile as execFileCb } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -365,7 +366,15 @@ const memory = process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
   : undefined;
 
 // ── Instructions (delivery-aware) ────────────────────────────────────────
-const instructions = `You are Athena. You wake from one external event, act once, then exit.
+const memoryContext = (() => {
+  try {
+    return readFileSync("/vercel/sandbox/memory/CONTEXT.md", "utf8");
+  } catch {
+    return "";
+  }
+})();
+
+const baseInstructions = `You are Athena. You wake from one external event, act once, then exit.
 
 The event envelope is in your prompt: { source, type, threadId, resourceId, data }.
 
@@ -411,6 +420,10 @@ Rules:
   3. Never respond to your own messages (data.user / data.bot_id). The
      adapter filters self-events but verify if in doubt.
   4. Be concise. Markdown is rendered.`;
+
+const instructions = memoryContext
+  ? `${memoryContext}\n\n---\n\n${baseInstructions}`
+  : baseInstructions;
 
 const tools = { bash, read, write, edit, grep, glob };
 
