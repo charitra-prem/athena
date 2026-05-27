@@ -10,6 +10,10 @@
       "maxDuration": 60,
       "includeFiles": ".build/agent.js"
     },
+    "api/sources/slack-command.ts": {
+      "memory": 256,
+      "maxDuration": 5
+    },
     "api/clerk-webhook.ts": {
       "memory": 256,
       "maxDuration": 30
