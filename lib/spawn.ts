@@ -97,11 +97,20 @@ export async function spawnSandbox(event: Envelope): Promise<{
   const stateKey = `sandbox:${event.threadId}`;
   const state = (await kv.get<ThreadState>(stateKey)) ?? {};
 
-  // Common sandbox auth
+  // Sandbox auth: prefer the auto-injected VERCEL_OIDC_TOKEN (refreshes every
+  // few minutes — can't expire), fall back to a long-lived VERCEL_TOKEN.
+  // SDK accepts either string as `token`; it just calls the Vercel API with
+  // it via Bearer. teamId/projectId still come from explicit env vars.
+  const token = process.env.VERCEL_OIDC_TOKEN || process.env.VERCEL_TOKEN;
+  if (!token) {
+    throw new Error(
+      "No Vercel credentials. Expected VERCEL_OIDC_TOKEN (auto-injected on Vercel) or VERCEL_TOKEN.",
+    );
+  }
   const auth = {
     teamId: process.env.VERCEL_TEAM_ID!,
     projectId: process.env.VERCEL_PROJECT_ID!,
-    token: process.env.VERCEL_TOKEN!,
+    token,
     fetch: cleanFetch,
   };
 
